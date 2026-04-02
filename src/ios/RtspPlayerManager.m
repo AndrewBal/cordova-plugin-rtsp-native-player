@@ -21,6 +21,9 @@
 @property (nonatomic, strong, nullable) NSData *inbandPps;
 @property (nonatomic, assign) BOOL decoderConfigured;
 
+// Camera switching
+@property (nonatomic, assign) BOOL isSwitchingCamera;
+
 // Stats
 @property (nonatomic, assign) NSUInteger rtpPacketCount;
 @property (nonatomic, strong) NSDate *playStartTime;
@@ -45,6 +48,7 @@
     _currentCamera = @"front";
     _decoderConfigured = NO;
     _rtpPacketCount = 0;
+    _isSwitchingCamera = NO;
     
     NSLog(@"[PlayerManager] Starting playback: front=%@ rear=%@ api=%@", frontUrl, rearUrl, apiBaseUrl);
     
@@ -62,6 +66,8 @@
         self.playerVC = [PlayerViewController new];
         self.playerVC.delegate = self;
         self.playerVC.titleText = title;
+        self.playerVC.apiBaseUrl = apiBaseUrl;
+        self.playerVC.currentCamera = self.currentCamera;
         self.playerVC.modalPresentationStyle = UIModalPresentationFullScreen;
         
         [presenter presentViewController:self.playerVC animated:YES completion:^{
@@ -101,7 +107,7 @@
 }
 
 // ─────────────────────────────────────────────
-#pragma mark - Internal
+#pragma mark - Internal: RTSP
 // ─────────────────────────────────────────────
 
 - (void)startRtspWithUrl:(NSString *)url {
@@ -111,6 +117,116 @@
     _rtspClient = [[RtspClient alloc] initWithUrl:url];
     _rtspClient.delegate = self;
     [_rtspClient start];
+}
+
+/**
+ * Restart RTSP connection (used after camera switch).
+ * Resets decoder state to accept new SPS/PPS from the switched camera stream.
+ */
+- (void)restartRtspWithUrl:(NSString *)url {
+    NSLog(@"[PlayerManager] Restarting RTSP with URL: %@", url);
+    
+    // Stop current RTSP
+    if (_rtspClient) {
+        [_rtspClient stop];
+        _rtspClient = nil;
+    }
+    
+    // Reset decoder and parser for new stream
+    [_decoder invalidate];
+    [_rtpParser reset];
+    
+    _decoderConfigured = NO;
+    _sdpSps = nil;
+    _sdpPps = nil;
+    _inbandSps = nil;
+    _inbandPps = nil;
+    _rtpPacketCount = 0;
+    
+    // Recreate decoder
+    _decoder = [H264Decoder new];
+    _decoder.delegate = self;
+    
+    // Recreate parser
+    _rtpParser = [RtpParser new];
+    _rtpParser.delegate = self;
+    
+    // Start new connection
+    [self startRtspWithUrl:url];
+}
+
+// ─────────────────────────────────────────────
+#pragma mark - Camera Switching
+// ─────────────────────────────────────────────
+
+/**
+ * Switch between front and rear camera.
+ *
+ * Hisnet cameras use getcamchnl.cgi to switch which physical camera
+ * outputs to the same RTSP stream URL.
+ *
+ * Sequence:
+ * 1. Stop current RTSP session
+ * 2. Call getcamchnl.cgi?&-camid=0 (front) or getcamchnl.cgi?&-camid=1 (rear)
+ * 3. Wait briefly for camera to switch
+ * 4. Restart RTSP with same front URL
+ */
+- (void)performCameraSwitch {
+    if (_isSwitchingCamera) {
+        NSLog(@"[PlayerManager] Camera switch already in progress, ignoring");
+        return;
+    }
+    _isSwitchingCamera = YES;
+    
+    // Toggle camera
+    _currentCamera = [_currentCamera isEqualToString:@"front"] ? @"rear" : @"front";
+    
+    NSLog(@"[PlayerManager] Switching camera to: %@", _currentCamera);
+    [self.delegate playerManager:self didChangeStatus:@"SWITCHING_CAMERA" message:_currentCamera];
+    
+    // Step 1: Call getcamchnl.cgi
+    NSInteger camId = [_currentCamera isEqualToString:@"front"] ? 0 : 1;
+    NSString *urlStr = [NSString stringWithFormat:@"%@/cgi-bin/hisnet/getcamchnl.cgi?&-camid=%ld",
+                        _apiBaseUrl, (long)camId];
+    NSURL *url = [NSURL URLWithString:urlStr];
+    
+    NSLog(@"[PlayerManager] Camera switch API: %@", urlStr);
+    
+    __weak __typeof__(self) weakSelf = self;
+    NSURLSessionDataTask *task = [[NSURLSession sharedSession] dataTaskWithURL:url
+                                                             completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
+        __strong __typeof__(weakSelf) self = weakSelf;
+        if (!self) return;
+        
+        NSHTTPURLResponse *http = (NSHTTPURLResponse *)response;
+        
+        if (http.statusCode >= 200 && http.statusCode < 300 && !error) {
+            NSLog(@"[PlayerManager] Camera switch API success, restarting RTSP in 500ms...");
+            
+            // Notify action
+            [self.delegate playerManager:self didReceiveAction:@"CAMERA_SWITCHED" camera:self.currentCamera data:nil];
+            
+            // Step 2: Wait a moment for hardware to switch, then restart RTSP
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(500 * NSEC_PER_MSEC)),
+                           dispatch_get_main_queue(), ^{
+                [self restartRtspWithUrl:self.frontUrl];
+                self.isSwitchingCamera = NO;
+            });
+        } else {
+            NSLog(@"[PlayerManager] Camera switch API failed: %@", error);
+            
+            // Revert camera state
+            self.currentCamera = [self.currentCamera isEqualToString:@"front"] ? @"rear" : @"front";
+            
+            dispatch_async(dispatch_get_main_queue(), ^{
+                self.playerVC.currentCamera = self.currentCamera;
+                [self.playerVC showToast:@"Failed to switch camera"];
+            });
+            
+            self.isSwitchingCamera = NO;
+        }
+    }];
+    [task resume];
 }
 
 // ─────────────────────────────────────────────
@@ -147,7 +263,6 @@
     if (channel == 0) {
         _rtpPacketCount++;
         
-        // Log first few packets to verify data flow
         if (_rtpPacketCount <= 3) {
             NSLog(@"[PlayerManager] RTP packet #%lu: %lu bytes",
                   (unsigned long)_rtpPacketCount, (unsigned long)data.length);
@@ -158,7 +273,6 @@
         
         [_rtpParser feedRtpPacket:data];
     }
-    // Ignore RTCP for now
 }
 
 - (void)rtspClient:(id)client didReceiveTrackInfo:(RtspTrackInfo *)trackInfo {
@@ -176,7 +290,6 @@
             NSLog(@"[PlayerManager] SDP PPS: %lu bytes", (unsigned long)_sdpPps.length);
         }
         
-        // Try to configure decoder with SDP parameters
         if (_sdpSps && _sdpPps) {
             [self configureDecoderWithSps:_sdpSps pps:_sdpPps source:@"SDP"];
         }
@@ -211,21 +324,18 @@
             break;
             
         case NalUnitTypeIDR:
-            // Keyframe — decode
             if (_decoderConfigured) {
                 [_decoder decodeNalUnit:nalUnit timestamp:timestamp isKeyframe:YES];
             }
             break;
             
         case NalUnitTypeSlice:
-            // P/B frame — decode
             if (_decoderConfigured) {
                 [_decoder decodeNalUnit:nalUnit timestamp:timestamp isKeyframe:NO];
             }
             break;
             
         case NalUnitTypeSEI:
-            // Ignore SEI for now
             break;
             
         default:
@@ -255,7 +365,6 @@
 // ─────────────────────────────────────────────
 
 - (void)h264DecoderDidDecodeFrame:(CMSampleBufferRef)sampleBuffer {
-    // Enqueue decoded frame to the display layer on main thread
     CFRetain(sampleBuffer);
     dispatch_async(dispatch_get_main_queue(), ^{
         [self.playerVC enqueueSampleBuffer:sampleBuffer];
@@ -280,11 +389,13 @@
 }
 
 - (void)playerViewControllerDidRequestRecordToggle {
+    // The VC already sends the HTTP command and updates its own UI.
+    // Forward action notification to JS.
     [self.delegate playerManager:self didReceiveAction:@"RECORD_TOGGLE" camera:_currentCamera data:nil];
 }
 
 - (void)playerViewControllerDidRequestCameraSwitch {
-    [self.delegate playerManager:self didReceiveAction:@"CAMERA_SWITCH" camera:_currentCamera data:nil];
+    [self performCameraSwitch];
 }
 
 @end

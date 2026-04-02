@@ -27,7 +27,8 @@ NS_ASSUME_NONNULL_BEGIN
  * - Creates RtspClient for RTSP/NWConnection
  * - Feeds RTP data through RtpParser → H264Decoder → PlayerViewController
  * - Manages player UI lifecycle (present/dismiss)
- * - Handles camera switching and HTTP commands
+ * - Handles camera switching (stop RTSP → getcamchnl.cgi → restart RTSP)
+ * - Handles photo/record commands via HTTP API
  */
 @interface RtspPlayerManager : NSObject
 
