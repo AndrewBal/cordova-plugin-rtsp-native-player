@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<plugin xmlns="http://apache.org/cordova/ns/plugins/1.0"
+        id="cordova-plugin-rtsp-native-player"
+        version="1.0.0">
+
+    <name>NativeRtspPlayer</name>
+    <description>Native iOS RTSP player using NWConnection + VideoToolbox</description>
+    <license>MIT</license>
+    <keywords>cordova,rtsp,player,dashcam,ios,native</keywords>
+
+    <js-module src="www/RtspHlsPlayer.js" name="RtspHlsPlayer">
+        <clobbers target="window.RtspHlsPlayer" />
+    </js-module>
+
+    <platform name="ios">
+        <config-file target="config.xml" parent="/*">
+            <feature name="RtspHlsPlayer">
+                <param name="ios-package" value="NativeRtspPlayerPlugin" />
+            </feature>
+        </config-file>
+
+        <!-- Objective-C sources — -fmodules required for Network.framework C API -->
+        <header-file src="src/ios/NativeRtspPlayerPlugin.h" />
+        <source-file src="src/ios/NativeRtspPlayerPlugin.m" compiler-flags="-fmodules" />
+
+        <header-file src="src/ios/RtspPlayerManager.h" />
+        <source-file src="src/ios/RtspPlayerManager.m" compiler-flags="-fmodules" />
+
+        <header-file src="src/ios/RtspClient.h" />
+        <source-file src="src/ios/RtspClient.m" compiler-flags="-fmodules" />
+
+        <header-file src="src/ios/RtpParser.h" />
+        <source-file src="src/ios/RtpParser.m" compiler-flags="-fmodules" />
+
+        <header-file src="src/ios/H264Decoder.h" />
+        <source-file src="src/ios/H264Decoder.m" compiler-flags="-fmodules" />
+
+        <header-file src="src/ios/PlayerViewController.h" />
+        <source-file src="src/ios/PlayerViewController.m" compiler-flags="-fmodules" />
+
+        <!-- Frameworks -->
+        <framework src="Network.framework" />
+        <framework src="VideoToolbox.framework" />
+        <framework src="AVFoundation.framework" />
+        <framework src="CoreMedia.framework" />
+        <framework src="CoreVideo.framework" />
+    </platform>
+</plugin>

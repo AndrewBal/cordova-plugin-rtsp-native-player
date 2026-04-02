@@ -1,0 +1,12 @@
+{
+  "name": "cordova-plugin-rtsp-native-player",
+  "version": "1.0.0",
+  "description": "Native iOS RTSP player using NWConnection + VideoToolbox for dashcam streaming",
+  "cordova": {
+    "id": "cordova-plugin-rtsp-native-player",
+    "platforms": ["ios"]
+  },
+  "keywords": ["cordova", "rtsp", "player", "dashcam", "ios", "native", "videotoolbox"],
+  "author": "Sinopacific Co Limited",
+  "license": "MIT"
+}
