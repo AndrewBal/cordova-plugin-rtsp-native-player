@@ -19,15 +19,12 @@ import android.widget.ProgressBar;
 import android.widget.TextView;
 import android.widget.Toast;
 
-import androidx.annotation.NonNull;
 import androidx.media3.common.MediaItem;
 import androidx.media3.common.PlaybackException;
 import androidx.media3.common.Player;
 import androidx.media3.exoplayer.ExoPlayer;
 import androidx.media3.exoplayer.rtsp.RtspMediaSource;
 import androidx.media3.ui.PlayerView;
-
-import org.json.JSONObject;
 
 import java.io.BufferedReader;
 import java.io.InputStream;
@@ -44,10 +41,8 @@ public class RtspNativePlayerActivity extends Activity {
     private PlayerView playerView;
     private ProgressBar loadingIndicator;
     private TextView statusLabel;
-    private TextView titleLabel;
     private TextView cameraLabel;
     private TextView recordingIndicator;
-    private Button photoButton;
     private Button recordButton;
     private Button switchButton;
 
@@ -153,7 +148,7 @@ public class RtspNativePlayerActivity extends Activity {
         closeButton.setOnClickListener(v -> finishPlayer());
         topBar.addView(closeButton, new LinearLayout.LayoutParams(dp(54), dp(54)));
 
-        titleLabel = new TextView(this);
+        TextView titleLabel = new TextView(this);
         titleLabel.setText(titleText);
         titleLabel.setTextColor(Color.WHITE);
         titleLabel.setTextSize(18);
@@ -190,7 +185,7 @@ public class RtspNativePlayerActivity extends Activity {
         bottomParams.gravity = Gravity.BOTTOM;
         root.addView(bottomControls, bottomParams);
 
-        photoButton = createRoundButton("📷", 60, Color.WHITE, Color.BLACK, 24);
+        Button photoButton = createRoundButton("📷", 60, Color.WHITE, Color.BLACK, 24);
         photoButton.setOnClickListener(v -> takePhoto());
         bottomControls.addView(photoButton, controlButtonParams());
 
@@ -257,12 +252,12 @@ public class RtspNativePlayerActivity extends Activity {
                     setStatus("PLAYING", null, "");
                     showLoading(false);
                 } else if (playbackState == Player.STATE_ENDED) {
-                    setStatus("CLOSED", null, "Stream ended");
+                    showStatusText("Stream ended");
                 }
             }
 
             @Override
-            public void onPlayerError(@NonNull PlaybackException error) {
+            public void onPlayerError(PlaybackException error) {
                 showStatusText("Error: " + error.getMessage());
                 RtspHlsPlayer.sendErrorToJs(error.getMessage());
             }
