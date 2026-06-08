@@ -245,6 +245,7 @@ public class RtspNativePlayerActivity extends Activity {
         releasePlayer();
 
         DefaultRenderersFactory renderersFactory = new DefaultRenderersFactory(this)
+                .forceDisableMediaCodecAsynchronousQueueing()
                 .setEnableDecoderFallback(true)
                 .setMediaCodecSelector(this::selectDecoders);
 
