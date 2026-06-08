@@ -7,6 +7,7 @@ import android.net.Uri;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
+import android.util.Log;
 import android.view.Gravity;
 import android.view.View;
 import android.view.ViewGroup;
@@ -22,7 +23,11 @@ import android.widget.Toast;
 import androidx.media3.common.MediaItem;
 import androidx.media3.common.PlaybackException;
 import androidx.media3.common.Player;
+import androidx.media3.exoplayer.DefaultRenderersFactory;
 import androidx.media3.exoplayer.ExoPlayer;
+import androidx.media3.exoplayer.mediacodec.MediaCodecInfo;
+import androidx.media3.exoplayer.mediacodec.MediaCodecSelector;
+import androidx.media3.exoplayer.mediacodec.MediaCodecUtil;
 import androidx.media3.exoplayer.rtsp.RtspMediaSource;
 import androidx.media3.ui.PlayerView;
 
@@ -31,10 +36,14 @@ import java.io.InputStream;
 import java.io.InputStreamReader;
 import java.net.HttpURLConnection;
 import java.net.URL;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
 public class RtspNativePlayerActivity extends Activity {
+    private static final String TAG = "RtspNativePlayer";
+    private static final String MIME_HEVC = "video/hevc";
     private static RtspNativePlayerActivity currentActivity;
 
     private FrameLayout root;
@@ -79,6 +88,8 @@ public class RtspNativePlayerActivity extends Activity {
 
         if (titleText == null || titleText.length() == 0) titleText = "Live";
         if (apiBaseUrl == null || apiBaseUrl.length() == 0) apiBaseUrl = "http://192.168.0.1";
+
+        Log.i(TAG, "Starting player. frontUrl=" + frontUrl + ", rearUrl=" + rearUrl + ", apiBaseUrl=" + apiBaseUrl);
 
         buildUi();
         checkCameraCount();
@@ -233,7 +244,13 @@ public class RtspNativePlayerActivity extends Activity {
 
         releasePlayer();
 
-        player = new ExoPlayer.Builder(this).build();
+        DefaultRenderersFactory renderersFactory = new DefaultRenderersFactory(this)
+                .setEnableDecoderFallback(true)
+                .setMediaCodecSelector(this::selectDecoders);
+
+        player = new ExoPlayer.Builder(this)
+                .setRenderersFactory(renderersFactory)
+                .build();
         playerView.setPlayer(player);
 
         RtspMediaSource.Factory factory = new RtspMediaSource.Factory()
@@ -258,12 +275,53 @@ public class RtspNativePlayerActivity extends Activity {
 
             @Override
             public void onPlayerError(PlaybackException error) {
+                Log.e(TAG, "Playback error", error);
                 showStatusText("Error: " + error.getMessage());
                 RtspHlsPlayer.sendErrorToJs(error.getMessage());
             }
         });
         player.prepare();
         player.play();
+    }
+
+    private List<MediaCodecInfo> selectDecoders(String mimeType,
+                                                boolean requiresSecureDecoder,
+                                                boolean requiresTunnelingDecoder) throws MediaCodecUtil.DecoderQueryException {
+        List<MediaCodecInfo> decoders = MediaCodecSelector.DEFAULT.getDecoderInfos(
+                mimeType,
+                requiresSecureDecoder,
+                requiresTunnelingDecoder
+        );
+
+        if (!MIME_HEVC.equals(mimeType) || decoders.size() <= 1) {
+            Log.i(TAG, "Decoders for " + mimeType + ": " + codecNames(decoders));
+            return decoders;
+        }
+
+        ArrayList<MediaCodecInfo> preferred = new ArrayList<>();
+        ArrayList<MediaCodecInfo> exynosC2 = new ArrayList<>();
+
+        for (MediaCodecInfo decoder : decoders) {
+            String name = decoder.name == null ? "" : decoder.name.toLowerCase();
+            if (name.contains("c2.exynos")) {
+                exynosC2.add(decoder);
+            } else {
+                preferred.add(decoder);
+            }
+        }
+
+        preferred.addAll(exynosC2);
+        Log.i(TAG, "HEVC decoder order: " + codecNames(preferred));
+        return preferred;
+    }
+
+    private String codecNames(List<MediaCodecInfo> decoders) {
+        StringBuilder builder = new StringBuilder();
+        for (int i = 0; i < decoders.size(); i++) {
+            if (i > 0) builder.append(", ");
+            builder.append(decoders.get(i).name);
+        }
+        return builder.toString();
     }
 
     private void restartPlayback(String url) {
