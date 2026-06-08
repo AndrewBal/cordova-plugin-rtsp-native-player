@@ -1,16 +1,50 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <plugin xmlns="http://apache.org/cordova/ns/plugins/1.0"
+        xmlns:android="http://schemas.android.com/apk/res/android"
         id="cordova-plugin-rtsp-native-player"
         version="1.0.0">
 
     <name>NativeRtspPlayer</name>
-    <description>Native iOS RTSP player using NWConnection + VideoToolbox</description>
+    <description>Native RTSP player for iOS and Android</description>
     <license>MIT</license>
-    <keywords>cordova,rtsp,player,dashcam,ios,native</keywords>
+    <keywords>cordova,rtsp,player,dashcam,ios,android,native</keywords>
 
     <js-module src="www/RtspHlsPlayer.js" name="RtspHlsPlayer">
         <clobbers target="window.RtspHlsPlayer" />
     </js-module>
+
+    <platform name="android">
+        <config-file target="res/xml/config.xml" parent="/*">
+            <feature name="RtspHlsPlayer">
+                <param name="android-package" value="com.andrewbal.rtspnativeplayer.RtspHlsPlayer" />
+            </feature>
+        </config-file>
+
+        <config-file target="AndroidManifest.xml" parent="/manifest">
+            <uses-permission android:name="android.permission.INTERNET" />
+            <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+        </config-file>
+
+        <edit-config file="AndroidManifest.xml" target="/manifest/application" mode="merge">
+            <application android:usesCleartextTraffic="true" />
+        </edit-config>
+
+        <config-file target="AndroidManifest.xml" parent="/manifest/application">
+            <activity android:name="com.andrewbal.rtspnativeplayer.RtspNativePlayerActivity"
+                      android:configChanges="orientation|screenSize|keyboardHidden|smallestScreenSize|screenLayout|uiMode"
+                      android:screenOrientation="sensor"
+                      android:theme="@style/RtspNativePlayerTheme"
+                      android:exported="false" />
+        </config-file>
+
+        <source-file src="src/android/RtspHlsPlayer.java" target-dir="src/com/andrewbal/rtspnativeplayer" />
+        <source-file src="src/android/RtspNativePlayerActivity.java" target-dir="src/com/andrewbal/rtspnativeplayer" />
+        <resource-file src="src/android/res/values/rtsp_native_player_styles.xml" target="res/values/rtsp_native_player_styles.xml" />
+
+        <framework src="androidx.media3:media3-exoplayer:1.3.1" />
+        <framework src="androidx.media3:media3-exoplayer-rtsp:1.3.1" />
+        <framework src="androidx.media3:media3-ui:1.3.1" />
+    </platform>
 
     <platform name="ios">
         <config-file target="config.xml" parent="/*">
