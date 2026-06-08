@@ -503,9 +503,23 @@
     NSString *urlStr = [NSString stringWithFormat:@"%@/cgi-bin/hisnet/getcamnum.cgi", _apiBaseUrl];
     NSURL *url = [NSURL URLWithString:urlStr];
     
-    NSURLSessionDataTask *task = [[NSURLSession sharedSession] dataTaskWithURL:url
-                                                             completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
-        if (error || !data) return;
+    // Use ephemeral session — same as XHR in WebView, which already routes via WiFi correctly
+    NSURLSessionConfiguration *config = [NSURLSessionConfiguration ephemeralSessionConfiguration];
+    config.timeoutIntervalForRequest = 5.0;
+    config.timeoutIntervalForResource = 5.0;
+    // Restrict to WiFi only (no cellular fallback)
+    config.allowsCellularAccess = NO;
+    NSURLSession *session = [NSURLSession sessionWithConfiguration:config];
+    
+    NSURLSessionDataTask *task = [session dataTaskWithURL:url
+                                       completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
+        if (error || !data) {
+            NSLog(@"[PlayerVC] Camera count check failed: %@", error.localizedDescription);
+            // Fallback: assume 2 cameras (most dashcams have front+rear)
+            // The button will appear; if camera only has 1, switch just won't work
+            [self setCameraCount:2];
+            return;
+        }
         
         NSString *responseText = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
         NSLog(@"[PlayerVC] Camera count response: %@", responseText);
@@ -519,8 +533,12 @@
                 NSString *numStr = [responseText substringWithRange:NSMakeRange(startIdx, endRange.location - startIdx)];
                 NSInteger num = [numStr integerValue];
                 [self setCameraCount:num];
+                return;
             }
         }
+        
+        // Parsing failed but got response — camera exists, assume 2
+        [self setCameraCount:2];
     }];
     [task resume];
 }
@@ -558,9 +576,6 @@
 }
 
 - (void)switchCamera {
-    _currentCamera = [_currentCamera isEqualToString:@"front"] ? @"rear" : @"front";
-    _cameraLabel.text = [_currentCamera isEqualToString:@"front"] ? @"Front" : @"Rear";
-    
     [self showToast:@"Switching camera..."];
     
     // Reset display for new stream
@@ -570,7 +585,29 @@
     _statusLabel.alpha = 1;
     [_internalDisplayLayer flush];
     
+    // Manager handles the actual toggle + API call + RTSP restart
+    // and then calls updateCameraLabel: to update our UI
     [self.delegate playerViewControllerDidRequestCameraSwitch];
+}
+
+/** Called by Manager after successful camera switch to update UI label */
+- (void)updateCameraLabel:(NSString *)camera {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        self.currentCamera = camera;
+        self.cameraLabel.text = [camera isEqualToString:@"front"] ? @"Front" : @"Rear";
+    });
+}
+
+/** Called by Manager on failed camera switch to restore UI */
+- (void)revertCameraSwitch {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [self showToast:@"Failed to switch camera"];
+        // Restore stream display if it was playing before
+        if (self.firstFrameRendered) {
+            [self.loadingIndicator stopAnimating];
+            self.statusLabel.alpha = 0;
+        }
+    });
 }
 
 #pragma mark - Camera HTTP API
@@ -579,8 +616,14 @@
     NSString *urlStr = [NSString stringWithFormat:@"%@/cgi-bin/hisnet/workmodecmd.cgi?-cmd=%@", _apiBaseUrl, cmd];
     NSURL *url = [NSURL URLWithString:urlStr];
     
-    NSURLSessionDataTask *task = [[NSURLSession sharedSession] dataTaskWithURL:url
-                                                             completionHandler:^(NSData *d, NSURLResponse *r, NSError *e) {
+    // WiFi-only session — camera is on local WiFi, not cellular
+    NSURLSessionConfiguration *config = [NSURLSessionConfiguration ephemeralSessionConfiguration];
+    config.timeoutIntervalForRequest = 5.0;
+    config.allowsCellularAccess = NO;
+    NSURLSession *session = [NSURLSession sessionWithConfiguration:config];
+    
+    NSURLSessionDataTask *task = [session dataTaskWithURL:url
+                                       completionHandler:^(NSData *d, NSURLResponse *r, NSError *e) {
         NSHTTPURLResponse *http = (NSHTTPURLResponse *)r;
         dispatch_async(dispatch_get_main_queue(), ^{
             if (http.statusCode >= 200 && http.statusCode < 300 && !e) {

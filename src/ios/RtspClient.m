@@ -466,7 +466,7 @@
         // Parse SDP
         RtspTrackInfo *track = [self parseSdp:response];
         if (!track) {
-            [self failWithError:@"No H.264 video track in SDP" response:response];
+            [self failWithError:@"No H.264/H.265 video track in SDP" response:response];
             return;
         }
         
@@ -797,16 +797,31 @@
             }
         }
         
-        // a=fmtp:96 packetization-mode=1;profile-level-id=64001E;sprop-parameter-sets=Z2QAHqwsaoNQ9puAgICB,aM4xshs=
+        // a=fmtp:<pt> ...
+        // H.264 (RFC 6184): sprop-parameter-sets=<SPS>,<PPS>
+        // H.265 (RFC 7798): sprop-vps=<VPS>;sprop-sps=<SPS>;sprop-pps=<PPS>
         if ([line hasPrefix:@"a=fmtp:"]) {
-            // sprop-parameter-sets
+            // H.264 — combined sprop-parameter-sets
             NSRegularExpression *spropRegex = [NSRegularExpression regularExpressionWithPattern:@"sprop-parameter-sets=([^;\\s]+)"
                                                                                        options:0 error:nil];
             NSTextCheckingResult *spropMatch = [spropRegex firstMatchInString:line options:0 range:NSMakeRange(0, line.length)];
             if (spropMatch) {
                 track.spropParameterSets = [line substringWithRange:[spropMatch rangeAtIndex:1]];
             }
-            
+
+            // H.265 — three separate sprop-* params
+            NSRegularExpression *vpsRegex = [NSRegularExpression regularExpressionWithPattern:@"sprop-vps=([^;\\s]+)" options:0 error:nil];
+            NSTextCheckingResult *vpsMatch = [vpsRegex firstMatchInString:line options:0 range:NSMakeRange(0, line.length)];
+            if (vpsMatch) track.spropVps = [line substringWithRange:[vpsMatch rangeAtIndex:1]];
+
+            NSRegularExpression *spsRegex = [NSRegularExpression regularExpressionWithPattern:@"sprop-sps=([^;\\s]+)" options:0 error:nil];
+            NSTextCheckingResult *spsMatch = [spsRegex firstMatchInString:line options:0 range:NSMakeRange(0, line.length)];
+            if (spsMatch) track.spropSps = [line substringWithRange:[spsMatch rangeAtIndex:1]];
+
+            NSRegularExpression *ppsRegex = [NSRegularExpression regularExpressionWithPattern:@"sprop-pps=([^;\\s]+)" options:0 error:nil];
+            NSTextCheckingResult *ppsMatch = [ppsRegex firstMatchInString:line options:0 range:NSMakeRange(0, line.length)];
+            if (ppsMatch) track.spropPps = [line substringWithRange:[ppsMatch rangeAtIndex:1]];
+
             // profile-level-id
             NSRegularExpression *plRegex = [NSRegularExpression regularExpressionWithPattern:@"profile-level-id=([0-9A-Fa-f]+)"
                                                                                     options:0 error:nil];
@@ -822,12 +837,16 @@
         }
     }
     
-    // Validate
-    if (track && [track.codec.uppercaseString isEqualToString:@"H264"]) {
-        if (track.clockRate == 0) track.clockRate = 90000;
-        return track;
+    // Validate — accept H.264 and H.265
+    if (track) {
+        NSString *codec = track.codec.uppercaseString;
+        if ([codec isEqualToString:@"H264"] ||
+            [codec isEqualToString:@"H265"] ||
+            [codec isEqualToString:@"HEVC"]) {
+            if (track.clockRate == 0) track.clockRate = 90000;
+            return track;
+        }
     }
-    
     return nil;
 }
 

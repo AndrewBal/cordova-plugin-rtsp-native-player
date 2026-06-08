@@ -46,6 +46,12 @@ NS_ASSUME_NONNULL_BEGIN
 /** Show/hide camera switch button based on camera count */
 - (void)setCameraCount:(NSInteger)count;
 
+/** Update the camera label after a successful switch (called by Manager) */
+- (void)updateCameraLabel:(NSString *)camera;
+
+/** Revert camera switch UI on failure (called by Manager) */
+- (void)revertCameraSwitch;
+
 @end
 
 NS_ASSUME_NONNULL_END

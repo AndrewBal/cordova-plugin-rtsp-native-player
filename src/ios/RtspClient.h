@@ -8,11 +8,15 @@ NS_ASSUME_NONNULL_BEGIN
  */
 @interface RtspTrackInfo : NSObject
 @property (nonatomic, copy) NSString *controlUrl;    // e.g. "trackID=0"
-@property (nonatomic, copy) NSString *codec;         // e.g. "H264"
-@property (nonatomic, assign) int payloadType;       // e.g. 96
-@property (nonatomic, assign) int clockRate;         // e.g. 90000
-@property (nonatomic, copy, nullable) NSString *spropParameterSets;  // base64 SPS,PPS
+@property (nonatomic, copy) NSString *codec;         // "H264" or "H265"
+@property (nonatomic, assign) int payloadType;
+@property (nonatomic, assign) int clockRate;
+@property (nonatomic, copy, nullable) NSString *spropParameterSets;  // H.264: base64 "SPS,PPS"
 @property (nonatomic, copy, nullable) NSString *profileLevelId;
+// H.265 sprop-* (RFC 7798) — each is a single base64-encoded NAL unit
+@property (nonatomic, copy, nullable) NSString *spropVps;
+@property (nonatomic, copy, nullable) NSString *spropSps;
+@property (nonatomic, copy, nullable) NSString *spropPps;
 @end
 
 /**

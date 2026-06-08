@@ -35,6 +35,9 @@
         <header-file src="src/ios/H264Decoder.h" />
         <source-file src="src/ios/H264Decoder.m" compiler-flags="-fmodules" />
 
+        <header-file src="src/ios/HEVCDecoder.h" />
+        <source-file src="src/ios/HEVCDecoder.m" compiler-flags="-fmodules" />
+
         <header-file src="src/ios/PlayerViewController.h" />
         <source-file src="src/ios/PlayerViewController.m" compiler-flags="-fmodules" />
 

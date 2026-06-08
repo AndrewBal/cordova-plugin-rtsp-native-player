@@ -1,10 +1,13 @@
 #import "RtspPlayerManager.h"
+#import "HEVCDecoder.h"
 
-@interface RtspPlayerManager () <RtspClientDelegate, RtpParserDelegate, H264DecoderDelegate, PlayerViewControllerDelegate>
+@interface RtspPlayerManager () <RtspClientDelegate, RtpParserDelegate, H264DecoderDelegate, HEVCDecoderDelegate, PlayerViewControllerDelegate>
 
 @property (nonatomic, strong) RtspClient *rtspClient;
 @property (nonatomic, strong) RtpParser *rtpParser;
-@property (nonatomic, strong) H264Decoder *decoder;
+@property (nonatomic, strong) H264Decoder *decoder;       // used for H.264 streams
+@property (nonatomic, strong) HEVCDecoder *hevcDecoder;   // used for H.265 streams
+@property (nonatomic, assign) BOOL isH265;
 @property (nonatomic, strong) PlayerViewController *playerVC;
 
 @property (nonatomic, copy) NSString *frontUrl;
@@ -16,9 +19,12 @@
 @property (nonatomic, strong, nullable) NSData *sdpSps;
 @property (nonatomic, strong, nullable) NSData *sdpPps;
 
-// SPS/PPS from in-band NAL units
+// SPS/PPS (+VPS for H.265) from in-band NAL units
+@property (nonatomic, strong, nullable) NSData *inbandVps;  // H.265 only
 @property (nonatomic, strong, nullable) NSData *inbandSps;
 @property (nonatomic, strong, nullable) NSData *inbandPps;
+// VPS/SPS/PPS from SDP for H.265
+@property (nonatomic, strong, nullable) NSData *sdpVps;
 @property (nonatomic, assign) BOOL decoderConfigured;
 
 // Camera switching
@@ -54,12 +60,12 @@
     
     [self.delegate playerManager:self didChangeStatus:@"STARTING" message:nil];
     
-    // Create components
+    // Create RTP parser. Codec mode set later from SDP (didReceiveTrackInfo).
     _rtpParser = [RtpParser new];
     _rtpParser.delegate = self;
-    
-    _decoder = [H264Decoder new];
-    _decoder.delegate = self;
+
+    // Decoders are created lazily after SDP tells us H.264 vs H.265.
+    _isH265 = NO;
     
     // Present player UI
     dispatch_async(dispatch_get_main_queue(), ^{
@@ -86,6 +92,7 @@
     }
     
     [_decoder invalidate];
+    [_hevcDecoder invalidate];
     [_rtpParser reset];
     
     dispatch_async(dispatch_get_main_queue(), ^{
@@ -132,22 +139,24 @@
         _rtspClient = nil;
     }
     
-    // Reset decoder and parser for new stream
+    // Reset decoders/parser for new stream
     [_decoder invalidate];
+    [_hevcDecoder invalidate];
     [_rtpParser reset];
-    
+
     _decoderConfigured = NO;
+    _sdpVps = nil;
     _sdpSps = nil;
     _sdpPps = nil;
+    _inbandVps = nil;
     _inbandSps = nil;
     _inbandPps = nil;
     _rtpPacketCount = 0;
-    
-    // Recreate decoder
-    _decoder = [H264Decoder new];
-    _decoder.delegate = self;
-    
-    // Recreate parser
+    _isH265 = NO;
+    _decoder = nil;
+    _hevcDecoder = nil;
+
+    // Recreate parser (codec mode set by next SDP)
     _rtpParser = [RtpParser new];
     _rtpParser.delegate = self;
     
@@ -178,23 +187,35 @@
     }
     _isSwitchingCamera = YES;
     
-    // Toggle camera
-    _currentCamera = [_currentCamera isEqualToString:@"front"] ? @"rear" : @"front";
+    // Toggle camera (only here — VC does NOT toggle)
+    NSString *newCamera = [_currentCamera isEqualToString:@"front"] ? @"rear" : @"front";
     
-    NSLog(@"[PlayerManager] Switching camera to: %@", _currentCamera);
-    [self.delegate playerManager:self didChangeStatus:@"SWITCHING_CAMERA" message:_currentCamera];
+    NSLog(@"[PlayerManager] Switching camera to: %@", newCamera);
+    [self.delegate playerManager:self didChangeStatus:@"SWITCHING_CAMERA" message:newCamera];
     
-    // Step 1: Call getcamchnl.cgi
-    NSInteger camId = [_currentCamera isEqualToString:@"front"] ? 0 : 1;
+    // Step 1: Stop current RTSP before switching hardware camera
+    if (_rtspClient) {
+        [_rtspClient stop];
+        _rtspClient = nil;
+    }
+    
+    // Step 2: Call getcamchnl.cgi to switch hardware camera
+    NSInteger camId = [newCamera isEqualToString:@"front"] ? 0 : 1;
     NSString *urlStr = [NSString stringWithFormat:@"%@/cgi-bin/hisnet/getcamchnl.cgi?&-camid=%ld",
                         _apiBaseUrl, (long)camId];
     NSURL *url = [NSURL URLWithString:urlStr];
     
     NSLog(@"[PlayerManager] Camera switch API: %@", urlStr);
     
+    // Use WiFi-only session
+    NSURLSessionConfiguration *config = [NSURLSessionConfiguration ephemeralSessionConfiguration];
+    config.timeoutIntervalForRequest = 5.0;
+    config.allowsCellularAccess = NO;
+    NSURLSession *session = [NSURLSession sessionWithConfiguration:config];
+    
     __weak __typeof__(self) weakSelf = self;
-    NSURLSessionDataTask *task = [[NSURLSession sharedSession] dataTaskWithURL:url
-                                                             completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
+    NSURLSessionDataTask *task = [session dataTaskWithURL:url
+                                       completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
         __strong __typeof__(weakSelf) self = weakSelf;
         if (!self) return;
         
@@ -203,10 +224,16 @@
         if (http.statusCode >= 200 && http.statusCode < 300 && !error) {
             NSLog(@"[PlayerManager] Camera switch API success, restarting RTSP in 500ms...");
             
-            // Notify action
-            [self.delegate playerManager:self didReceiveAction:@"CAMERA_SWITCHED" camera:self.currentCamera data:nil];
+            // Commit state change
+            self.currentCamera = newCamera;
             
-            // Step 2: Wait a moment for hardware to switch, then restart RTSP
+            // Update VC label
+            [self.playerVC updateCameraLabel:newCamera];
+            
+            // Notify JS
+            [self.delegate playerManager:self didReceiveAction:@"CAMERA_SWITCHED" camera:newCamera data:nil];
+            
+            // Step 3: Wait for hardware to switch, then restart RTSP
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(500 * NSEC_PER_MSEC)),
                            dispatch_get_main_queue(), ^{
                 [self restartRtspWithUrl:self.frontUrl];
@@ -215,15 +242,14 @@
         } else {
             NSLog(@"[PlayerManager] Camera switch API failed: %@", error);
             
-            // Revert camera state
-            self.currentCamera = [self.currentCamera isEqualToString:@"front"] ? @"rear" : @"front";
+            // Revert VC UI
+            [self.playerVC revertCameraSwitch];
             
+            // Restart RTSP with original camera (stream was stopped)
             dispatch_async(dispatch_get_main_queue(), ^{
-                self.playerVC.currentCamera = self.currentCamera;
-                [self.playerVC showToast:@"Failed to switch camera"];
+                [self restartRtspWithUrl:self.frontUrl];
+                self.isSwitchingCamera = NO;
             });
-            
-            self.isSwitchingCamera = NO;
         }
     }];
     [task resume];
@@ -277,21 +303,45 @@
 
 - (void)rtspClient:(id)client didReceiveTrackInfo:(RtspTrackInfo *)trackInfo {
     NSLog(@"[PlayerManager] Track info received: %@", trackInfo);
-    
-    // Decode SPS/PPS from SDP sprop-parameter-sets
-    if (trackInfo.spropParameterSets) {
-        NSArray *parts = [trackInfo.spropParameterSets componentsSeparatedByString:@","];
-        if (parts.count >= 1) {
-            _sdpSps = [[NSData alloc] initWithBase64EncodedString:parts[0] options:0];
-            NSLog(@"[PlayerManager] SDP SPS: %lu bytes", (unsigned long)_sdpSps.length);
+
+    NSString *codec = trackInfo.codec.uppercaseString;
+    _isH265 = ([codec isEqualToString:@"H265"] || [codec isEqualToString:@"HEVC"]);
+    _rtpParser.isH265 = _isH265;
+
+    if (_isH265) {
+        // Create HEVC decoder
+        _hevcDecoder = [HEVCDecoder new];
+        _hevcDecoder.delegate = self;
+
+        // Parse SDP sprop-vps / sprop-sps / sprop-pps (each base64 of a complete NAL)
+        if (trackInfo.spropVps) _sdpVps = [[NSData alloc] initWithBase64EncodedString:trackInfo.spropVps options:0];
+        if (trackInfo.spropSps) _sdpSps = [[NSData alloc] initWithBase64EncodedString:trackInfo.spropSps options:0];
+        if (trackInfo.spropPps) _sdpPps = [[NSData alloc] initWithBase64EncodedString:trackInfo.spropPps options:0];
+
+        NSLog(@"[PlayerManager] H.265 SDP VPS:%lu SPS:%lu PPS:%lu",
+              (unsigned long)_sdpVps.length, (unsigned long)_sdpSps.length, (unsigned long)_sdpPps.length);
+
+        if (_sdpVps && _sdpSps && _sdpPps) {
+            [self configureHEVCDecoderWithVps:_sdpVps sps:_sdpSps pps:_sdpPps source:@"SDP"];
         }
-        if (parts.count >= 2) {
-            _sdpPps = [[NSData alloc] initWithBase64EncodedString:parts[1] options:0];
-            NSLog(@"[PlayerManager] SDP PPS: %lu bytes", (unsigned long)_sdpPps.length);
-        }
-        
-        if (_sdpSps && _sdpPps) {
-            [self configureDecoderWithSps:_sdpSps pps:_sdpPps source:@"SDP"];
+    } else {
+        // H.264 path (unchanged)
+        _decoder = [H264Decoder new];
+        _decoder.delegate = self;
+
+        if (trackInfo.spropParameterSets) {
+            NSArray *parts = [trackInfo.spropParameterSets componentsSeparatedByString:@","];
+            if (parts.count >= 1) {
+                _sdpSps = [[NSData alloc] initWithBase64EncodedString:parts[0] options:0];
+                NSLog(@"[PlayerManager] SDP SPS: %lu bytes", (unsigned long)_sdpSps.length);
+            }
+            if (parts.count >= 2) {
+                _sdpPps = [[NSData alloc] initWithBase64EncodedString:parts[1] options:0];
+                NSLog(@"[PlayerManager] SDP PPS: %lu bytes", (unsigned long)_sdpPps.length);
+            }
+            if (_sdpSps && _sdpPps) {
+                [self configureDecoderWithSps:_sdpSps pps:_sdpPps source:@"SDP"];
+            }
         }
     }
 }
@@ -307,7 +357,14 @@
 // ─────────────────────────────────────────────
 
 - (void)rtpParserDidReceiveNalUnit:(NSData *)nalUnit type:(NalUnitType)type timestamp:(uint32_t)timestamp {
-    
+    if (_isH265) {
+        [self handleH265NalUnit:nalUnit type:(uint8_t)type timestamp:timestamp];
+    } else {
+        [self handleH264NalUnit:nalUnit type:type timestamp:timestamp];
+    }
+}
+
+- (void)handleH264NalUnit:(NSData *)nalUnit type:(NalUnitType)type timestamp:(uint32_t)timestamp {
     switch (type) {
         case NalUnitTypeSPS:
             _inbandSps = nalUnit;
@@ -315,31 +372,70 @@
                 [self configureDecoderWithSps:_inbandSps pps:_inbandPps source:@"in-band"];
             }
             break;
-            
         case NalUnitTypePPS:
             _inbandPps = nalUnit;
             if (_inbandSps && !_decoderConfigured) {
                 [self configureDecoderWithSps:_inbandSps pps:_inbandPps source:@"in-band"];
             }
             break;
-            
         case NalUnitTypeIDR:
-            if (_decoderConfigured) {
-                [_decoder decodeNalUnit:nalUnit timestamp:timestamp isKeyframe:YES];
-            }
+            if (_decoderConfigured) [_decoder decodeNalUnit:nalUnit timestamp:timestamp isKeyframe:YES];
             break;
-            
         case NalUnitTypeSlice:
-            if (_decoderConfigured) {
-                [_decoder decodeNalUnit:nalUnit timestamp:timestamp isKeyframe:NO];
-            }
+            if (_decoderConfigured) [_decoder decodeNalUnit:nalUnit timestamp:timestamp isKeyframe:NO];
             break;
-            
         case NalUnitTypeSEI:
-            break;
-            
         default:
             break;
+    }
+}
+
+- (void)handleH265NalUnit:(NSData *)nalUnit type:(uint8_t)type timestamp:(uint32_t)timestamp {
+    switch (type) {
+        case 32:  // VPS_NUT
+            _inbandVps = nalUnit;
+            if (_inbandSps && _inbandPps && !_decoderConfigured) {
+                [self configureHEVCDecoderWithVps:_inbandVps sps:_inbandSps pps:_inbandPps source:@"in-band"];
+            }
+            break;
+        case 33:  // SPS_NUT
+            _inbandSps = nalUnit;
+            if (_inbandVps && _inbandPps && !_decoderConfigured) {
+                [self configureHEVCDecoderWithVps:_inbandVps sps:_inbandSps pps:_inbandPps source:@"in-band"];
+            }
+            break;
+        case 34:  // PPS_NUT
+            _inbandPps = nalUnit;
+            if (_inbandVps && _inbandSps && !_decoderConfigured) {
+                [self configureHEVCDecoderWithVps:_inbandVps sps:_inbandSps pps:_inbandPps source:@"in-band"];
+            }
+            break;
+        case 19:  // IDR_W_RADL
+        case 20:  // IDR_N_LP
+        case 21:  // CRA_NUT — also keyframe for decoding purposes
+            if (_decoderConfigured) [_hevcDecoder decodeNalUnit:nalUnit timestamp:timestamp isKeyframe:YES];
+            break;
+        case 39:  // PREFIX_SEI
+        case 40:  // SUFFIX_SEI
+            break;
+        default:
+            // VCL trail/etc. — treat as non-key slice
+            if (type <= 31 && _decoderConfigured) {
+                [_hevcDecoder decodeNalUnit:nalUnit timestamp:timestamp isKeyframe:NO];
+            }
+            break;
+    }
+}
+
+- (void)configureHEVCDecoderWithVps:(NSData *)vps sps:(NSData *)sps pps:(NSData *)pps source:(NSString *)source {
+    NSLog(@"[PlayerManager] Configuring HEVC decoder with %@ VPS(%lu) SPS(%lu) PPS(%lu)",
+          source, (unsigned long)vps.length, (unsigned long)sps.length, (unsigned long)pps.length);
+    BOOL ok = [_hevcDecoder configureWithVps:vps sps:sps pps:pps];
+    if (ok) {
+        _decoderConfigured = YES;
+        NSLog(@"[PlayerManager] HEVC decoder configured ✓");
+    } else {
+        NSLog(@"[PlayerManager] HEVC decoder configuration failed!");
     }
 }
 
@@ -373,7 +469,23 @@
 }
 
 - (void)h264DecoderDidFailWithError:(NSString *)error {
-    NSLog(@"[PlayerManager] Decoder error: %@", error);
+    NSLog(@"[PlayerManager] H.264 decoder error: %@", error);
+}
+
+// ─────────────────────────────────────────────
+#pragma mark - HEVCDecoderDelegate
+// ─────────────────────────────────────────────
+
+- (void)hevcDecoderDidDecodeFrame:(CMSampleBufferRef)sampleBuffer {
+    CFRetain(sampleBuffer);
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [self.playerVC enqueueSampleBuffer:sampleBuffer];
+        CFRelease(sampleBuffer);
+    });
+}
+
+- (void)hevcDecoderDidFailWithError:(NSString *)error {
+    NSLog(@"[PlayerManager] HEVC decoder error: %@", error);
 }
 
 // ─────────────────────────────────────────────

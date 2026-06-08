@@ -5,14 +5,31 @@ NS_ASSUME_NONNULL_BEGIN
 /**
  * H.264 NAL unit types we care about
  */
+// H.264 NAL types (RFC 6184) — 5-bit type, single-byte header
 typedef NS_ENUM(uint8_t, NalUnitType) {
-    NalUnitTypeSlice        = 1,   // non-IDR slice
-    NalUnitTypeIDR          = 5,   // IDR slice (keyframe)
-    NalUnitTypeSEI          = 6,   // SEI
-    NalUnitTypeSPS          = 7,   // Sequence Parameter Set
-    NalUnitTypePPS          = 8,   // Picture Parameter Set
-    NalUnitTypeSTAP_A       = 24,  // Aggregation packet
-    NalUnitTypeFU_A         = 28,  // Fragmentation unit
+    NalUnitTypeSlice        = 1,
+    NalUnitTypeIDR          = 5,
+    NalUnitTypeSEI          = 6,
+    NalUnitTypeSPS          = 7,
+    NalUnitTypePPS          = 8,
+    NalUnitTypeSTAP_A       = 24,
+    NalUnitTypeFU_A         = 28,
+};
+
+// H.265 NAL types (RFC 7798) — 6-bit type, two-byte header
+typedef NS_ENUM(uint8_t, H265NalUnitType) {
+    H265NalUnitTypeTRAIL_N   = 0,
+    H265NalUnitTypeTRAIL_R   = 1,
+    H265NalUnitTypeIDR_W_RADL = 19,
+    H265NalUnitTypeIDR_N_LP  = 20,
+    H265NalUnitTypeCRA_NUT   = 21,
+    H265NalUnitTypeVPS_NUT   = 32,
+    H265NalUnitTypeSPS_NUT   = 33,
+    H265NalUnitTypePPS_NUT   = 34,
+    H265NalUnitTypePREFIX_SEI = 39,
+    H265NalUnitTypeSUFFIX_SEI = 40,
+    H265NalUnitTypeAP        = 48,  // Aggregation Packet
+    H265NalUnitTypeFU        = 49,  // Fragmentation Unit
 };
 
 @protocol RtpParserDelegate <NSObject>
@@ -37,6 +54,9 @@ typedef NS_ENUM(uint8_t, NalUnitType) {
 @interface RtpParser : NSObject
 
 @property (nonatomic, weak) id<RtpParserDelegate> delegate;
+
+/** Set codec mode. NO (default) = H.264. YES = H.265. Must be set before feeding packets. */
+@property (nonatomic, assign) BOOL isH265;
 
 /** Number of RTP packets processed */
 @property (nonatomic, readonly) NSUInteger packetsReceived;
