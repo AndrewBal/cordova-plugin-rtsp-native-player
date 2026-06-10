@@ -35,7 +35,9 @@ var RtspHlsPlayer = {
             options.frontUrl || '',
             options.rearUrl || '',
             options.title || 'Live',
-            options.apiBaseUrl || ''
+            options.apiBaseUrl || '',
+            options.forceVlc ? true : false,
+            options.deviceType || ''
         ];
 
         // We use a single native callback channel that dispatches to the

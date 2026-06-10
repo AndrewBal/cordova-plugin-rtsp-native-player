@@ -23,6 +23,7 @@ import android.widget.Toast;
 import androidx.media3.common.MediaItem;
 import androidx.media3.common.PlaybackException;
 import androidx.media3.common.Player;
+import androidx.media3.exoplayer.DefaultLoadControl;
 import androidx.media3.exoplayer.DefaultRenderersFactory;
 import androidx.media3.exoplayer.ExoPlayer;
 import androidx.media3.exoplayer.mediacodec.MediaCodecInfo;
@@ -30,6 +31,11 @@ import androidx.media3.exoplayer.mediacodec.MediaCodecSelector;
 import androidx.media3.exoplayer.mediacodec.MediaCodecUtil;
 import androidx.media3.exoplayer.rtsp.RtspMediaSource;
 import androidx.media3.ui.PlayerView;
+
+import org.videolan.libvlc.LibVLC;
+import org.videolan.libvlc.Media;
+import org.videolan.libvlc.MediaPlayer;
+import org.videolan.libvlc.util.VLCVideoLayout;
 
 import java.io.BufferedReader;
 import java.io.InputStream;
@@ -48,6 +54,7 @@ public class RtspNativePlayerActivity extends Activity {
 
     private FrameLayout root;
     private PlayerView playerView;
+    private VLCVideoLayout vlcLayout;
     private ProgressBar loadingIndicator;
     private TextView statusLabel;
     private TextView cameraLabel;
@@ -55,11 +62,19 @@ public class RtspNativePlayerActivity extends Activity {
     private Button recordButton;
     private Button switchButton;
 
+    // ExoPlayer
     private ExoPlayer player;
+
+    // libVLC
+    private LibVLC libVlc;
+    private MediaPlayer vlcPlayer;
+
     private String frontUrl;
     private String rearUrl;
     private String titleText;
     private String apiBaseUrl;
+    private boolean forceVlc;
+    private String deviceType;
     private String currentCamera = "front";
     private boolean isRecording = false;
     private boolean isSwitchingCamera = false;
@@ -85,14 +100,29 @@ public class RtspNativePlayerActivity extends Activity {
         rearUrl = getIntent().getStringExtra("rearUrl");
         titleText = getIntent().getStringExtra("title");
         apiBaseUrl = getIntent().getStringExtra("apiBaseUrl");
+        forceVlc = getIntent().getBooleanExtra("forceVlc", false);
+        deviceType = getIntent().getStringExtra("deviceType");
+        if (deviceType == null) deviceType = "";
+
+        // Lombotech: VLC/live555 dead-ends here — "Unable to determine our source address:
+        // 0.0.0.0" → no RTP → EndReached after ~1 frame (WifiManager IP returns 0 on modern
+        // Samsung, so --miface-addr never applies). ExoPlayer-RTSP (TCP-forced) pulls it fine.
+        if ("lombotech".equals(deviceType)) {
+            forceVlc = false;
+        }
 
         if (titleText == null || titleText.length() == 0) titleText = "Live";
         if (apiBaseUrl == null || apiBaseUrl.length() == 0) apiBaseUrl = "http://192.168.0.1";
 
-        Log.i(TAG, "Starting player. frontUrl=" + frontUrl + ", rearUrl=" + rearUrl + ", apiBaseUrl=" + apiBaseUrl);
+        Log.i(TAG, "Starting player. frontUrl=" + frontUrl + ", rearUrl=" + rearUrl + ", apiBaseUrl=" + apiBaseUrl + ", forceVlc=" + forceVlc);
 
         buildUi();
-        checkCameraCount();
+        if ("lombotech".equals(deviceType)) {
+            startLombotechHeartbeat();
+        }
+        if ("lombotech".equals(deviceType) || (rearUrl != null && rearUrl.length() > 0)) {
+            checkCameraCount();
+        }
         startPlayback(frontUrl);
     }
 
@@ -115,13 +145,21 @@ public class RtspNativePlayerActivity extends Activity {
                 ViewGroup.LayoutParams.MATCH_PARENT
         ));
 
-        playerView = new PlayerView(this);
-        playerView.setUseController(false);
-        playerView.setResizeMode(androidx.media3.ui.AspectRatioFrameLayout.RESIZE_MODE_FIT);
-        root.addView(playerView, new FrameLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                ViewGroup.LayoutParams.MATCH_PARENT
-        ));
+        if (forceVlc) {
+            vlcLayout = new VLCVideoLayout(this);
+            root.addView(vlcLayout, new FrameLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                    ViewGroup.LayoutParams.MATCH_PARENT
+            ));
+        } else {
+            playerView = new PlayerView(this);
+            playerView.setUseController(false);
+            playerView.setResizeMode(androidx.media3.ui.AspectRatioFrameLayout.RESIZE_MODE_FIT);
+            root.addView(playerView, new FrameLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                    ViewGroup.LayoutParams.MATCH_PARENT
+            ));
+        }
 
         loadingIndicator = new ProgressBar(this);
         FrameLayout.LayoutParams progressParams = new FrameLayout.LayoutParams(dp(52), dp(52));
@@ -241,25 +279,112 @@ public class RtspNativePlayerActivity extends Activity {
     private void startPlayback(String url) {
         setStatus("CONNECTING", null, "Connecting...");
         showLoading(true);
-
         releasePlayer();
 
+        if (forceVlc) {
+            startVlcPlayback(url);
+        } else {
+            startExoPlayback(url);
+        }
+    }
+
+    private void startVlcPlayback(String url) {
+        Log.i(TAG, "startVlcPlayback url=" + url);
+        ArrayList<String> vlcOptions = new ArrayList<>();
+        vlcOptions.add("--rtsp-tcp");
+        vlcOptions.add("--network-caching=300");
+
+        // live555 iterates all interfaces and hits dummy ones with 0.0.0.0, causing
+        // RTCP keepalive failures (camera drops session at ~10s). Fix: force Wi-Fi IP.
+        try {
+            android.net.wifi.WifiManager wm = (android.net.wifi.WifiManager)
+                    getApplicationContext().getSystemService(android.content.Context.WIFI_SERVICE);
+            if (wm != null) {
+                int ipInt = wm.getConnectionInfo().getIpAddress();
+                if (ipInt != 0) {
+                    String ipStr = String.format(java.util.Locale.US, "%d.%d.%d.%d",
+                            ipInt & 0xff, (ipInt >> 8) & 0xff,
+                            (ipInt >> 16) & 0xff, (ipInt >> 24) & 0xff);
+                    vlcOptions.add("--miface-addr=" + ipStr);
+                    Log.i(TAG, "VLC RTCP bind IP: " + ipStr);
+                }
+            }
+        } catch (Exception e) {
+            Log.w(TAG, "VLC RTCP bind: failed to get Wi-Fi IP: " + e.getMessage());
+        }
+
+        libVlc = new LibVLC(this, vlcOptions);
+        vlcPlayer = new MediaPlayer(libVlc);
+        vlcPlayer.attachViews(vlcLayout, null, false, false);
+
+        Media media = new Media(libVlc, Uri.parse(url));
+        media.addOption(":network-caching=300");
+        media.addOption(":no-audio");
+        vlcPlayer.setMedia(media);
+        media.release();
+
+        vlcPlayer.setEventListener(event -> {
+            switch (event.type) {
+                case MediaPlayer.Event.Buffering:
+                    mainHandler.post(() -> {
+                        setStatus("BUFFERING", null, "Buffering...");
+                        showLoading(true);
+                    });
+                    break;
+                case MediaPlayer.Event.Playing:
+                    mainHandler.post(() -> {
+                        setStatus("PLAYING", null, "");
+                        showLoading(false);
+                    });
+                    break;
+                case MediaPlayer.Event.EncounteredError:
+                    Log.e(TAG, "VLC EncounteredError");
+                    mainHandler.post(() -> {
+                        showStatusText("Stream error");
+                        RtspHlsPlayer.sendErrorToJs("VLC stream error");
+                    });
+                    break;
+                case MediaPlayer.Event.EndReached:
+                    Log.w(TAG, "VLC EndReached (stream stopped or timed out)");
+                    mainHandler.post(() -> showStatusText("Stream ended"));
+                    break;
+            }
+        });
+
+        vlcPlayer.play();
+    }
+
+    private void startExoPlayback(String url) {
         DefaultRenderersFactory renderersFactory = new DefaultRenderersFactory(this)
                 .forceDisableMediaCodecAsynchronousQueueing()
                 .setEnableDecoderFallback(true)
                 .setMediaCodecSelector(this::selectDecoders);
+        boolean isHls = url != null && (url.contains(".m3u8") || url.startsWith("file://"));
+        ExoPlayer.Builder playerBuilder = new ExoPlayer.Builder(this)
+                .setRenderersFactory(renderersFactory);
 
-        player = new ExoPlayer.Builder(this)
-                .setRenderersFactory(renderersFactory)
-                .build();
+        if (isHls) {
+            playerBuilder.setLoadControl(
+                    new DefaultLoadControl.Builder()
+                            .setBufferDurationsMs(1500, 4000, 250, 500)
+                            .build()
+            );
+        }
+
+        player = playerBuilder.build();
         playerView.setPlayer(player);
 
-        RtspMediaSource.Factory factory = new RtspMediaSource.Factory()
-                .setForceUseRtpTcp(true)
-                .setTimeoutMs(15000);
-
         MediaItem mediaItem = MediaItem.fromUri(Uri.parse(url));
-        player.setMediaSource(factory.createMediaSource(mediaItem));
+        if (isHls) {
+            // FFmpeg→HLS (Lombotech): H.264-SDP камеры без sprop-parameter-sets, чего
+            // Media3-RTSP требует и падает; FFmpeg это терпит. Играем локальный m3u8 как HLS.
+            player.setMediaItem(mediaItem);
+        } else {
+            RtspMediaSource.Factory factory = new RtspMediaSource.Factory()
+                    .setForceUseRtpTcp(true)
+                    .setTimeoutMs(15000);
+            player.setMediaSource(factory.createMediaSource(mediaItem));
+        }
         player.addListener(new Player.Listener() {
             @Override
             public void onPlaybackStateChanged(int playbackState) {
@@ -334,7 +459,7 @@ public class RtspNativePlayerActivity extends Activity {
         showToast("Taking photo...");
         RtspHlsPlayer.sendActionToJs("PHOTO", currentCamera, null);
 
-        sendCameraCommand("trigger", () -> {
+        sendCameraCommand("/app/snapshot", "trigger", () -> {
             showToast("Photo saved!");
             RtspHlsPlayer.sendActionToJs("PHOTO_SUCCESS", currentCamera, null);
         }, () -> {
@@ -347,14 +472,17 @@ public class RtspNativePlayerActivity extends Activity {
         boolean start = !isRecording;
         showToast(start ? "Starting..." : "Stopping...");
 
-        sendCameraCommand(start ? "start" : "stop", () -> {
-            isRecording = start;
-            recordingIndicator.setVisibility(isRecording ? View.VISIBLE : View.GONE);
-            recordButton.setTextColor(isRecording ? Color.WHITE : Color.BLACK);
-            recordButton.setBackground(makeRoundedBg(isRecording ? Color.RED : Color.WHITE, dp(30)));
-            showToast(start ? "Recording" : "Stopped");
-            RtspHlsPlayer.sendActionToJs(start ? "RECORD_START" : "RECORD_STOP", currentCamera, null);
-        }, () -> showToast("Failed"));
+        sendCameraCommand(
+            start ? "/app/setparamvalue?param=rec&value=1" : "/app/setparamvalue?param=rec&value=0",
+            start ? "start" : "stop",
+            () -> {
+                isRecording = start;
+                recordingIndicator.setVisibility(isRecording ? View.VISIBLE : View.GONE);
+                recordButton.setTextColor(isRecording ? Color.WHITE : Color.BLACK);
+                recordButton.setBackground(makeRoundedBg(isRecording ? Color.RED : Color.WHITE, dp(30)));
+                showToast(start ? "Recording" : "Stopped");
+                RtspHlsPlayer.sendActionToJs(start ? "RECORD_START" : "RECORD_STOP", currentCamera, null);
+            }, () -> showToast("Failed"));
     }
 
     private void switchCamera() {
@@ -369,8 +497,10 @@ public class RtspNativePlayerActivity extends Activity {
         showLoading(true);
         releasePlayer();
 
-        String url = apiBaseUrl + "/cgi-bin/hisnet/getcamchnl.cgi?&-camid=" + camId;
-        httpGet(url, response -> mainHandler.post(() -> {
+        String switchUrl = "lombotech".equals(deviceType)
+                ? apiBaseUrl + "/app/setparamvalue?param=switchcam&value=" + camId
+                : apiBaseUrl + "/cgi-bin/hisnet/getcamchnl.cgi?&-camid=" + camId;
+        httpGet(switchUrl, response -> mainHandler.post(() -> {
             currentCamera = newCamera;
             cameraLabel.setText("front".equals(currentCamera) ? "Front" : "Rear");
             RtspHlsPlayer.sendActionToJs("CAMERA_SWITCHED", currentCamera, null);
@@ -383,12 +513,49 @@ public class RtspNativePlayerActivity extends Activity {
         }));
     }
 
+    // Lombotech RTSP keepalive: GET /app/getparamvalue?param=rec живет в нативной
+    // activity, потому что WebView уходит в background. Отдельный TCP-push socket
+    // на :5000 для HLS-режима не нужен и только добавляет лишнюю нестабильность.
+    // Камера рвёт RTSP-сессию через ~10с без heartbeat. WebView на паузе, пока эта Activity
+    // на переднем плане, поэтому JS-таймер задросселило бы — heartbeat обязан жить тут, нативно.
+    private Handler heartbeatHandler;
+    private Runnable heartbeatRunnable;
+
+    private void startLombotechHeartbeat() {
+        stopLombotechHeartbeat();
+        heartbeatHandler = new Handler(Looper.getMainLooper());
+        heartbeatRunnable = new Runnable() {
+            @Override
+            public void run() {
+                httpGet(
+                        apiBaseUrl + "/app/getparamvalue?param=rec",
+                        resp -> {},
+                        () -> Log.w(TAG, "Lombotech heartbeat failed")
+                );
+                if (heartbeatHandler != null) heartbeatHandler.postDelayed(this, 3000);
+            }
+        };
+        heartbeatHandler.post(heartbeatRunnable);
+    }
+
+    private void stopLombotechHeartbeat() {
+        if (heartbeatHandler != null && heartbeatRunnable != null) {
+            heartbeatHandler.removeCallbacks(heartbeatRunnable);
+        }
+        heartbeatHandler = null;
+        heartbeatRunnable = null;
+    }
+
     private void checkCameraCount() {
-        String url = apiBaseUrl + "/cgi-bin/hisnet/getcamnum.cgi";
+        String url = "lombotech".equals(deviceType)
+                ? apiBaseUrl + "/app/getdeviceattr"
+                : apiBaseUrl + "/cgi-bin/hisnet/getcamnum.cgi";
         httpGet(url, response -> mainHandler.post(() -> {
-            int count = parseCameraCount(response);
-            setCameraCount(count >= 1 ? count : 2);
-        }), () -> mainHandler.post(() -> setCameraCount(2)));
+            int count = "lombotech".equals(deviceType)
+                    ? parseLombotechCamnum(response)
+                    : parseCameraCount(response);
+            if (count >= 2) setCameraCount(count);
+        }), () -> {});
     }
 
     private int parseCameraCount(String response) {
@@ -406,15 +573,28 @@ public class RtspNativePlayerActivity extends Activity {
         }
     }
 
+    private int parseLombotechCamnum(String response) {
+        if (response == null) return 0;
+        try {
+            org.json.JSONObject json = new org.json.JSONObject(response);
+            org.json.JSONObject info = json.optJSONObject("info");
+            return info != null ? info.optInt("camnum", 0) : json.optInt("camnum", 0);
+        } catch (Exception e) {
+            return 0;
+        }
+    }
+
     private void setCameraCount(int count) {
-        if (count >= 2 || (rearUrl != null && rearUrl.length() > 0)) {
+        if (count >= 2 || "lombotech".equals(deviceType) || (rearUrl != null && rearUrl.length() > 0)) {
             switchButton.setVisibility(View.VISIBLE);
             cameraLabel.setVisibility(View.VISIBLE);
         }
     }
 
-    private void sendCameraCommand(String cmd, Runnable success, Runnable failure) {
-        String url = apiBaseUrl + "/cgi-bin/hisnet/workmodecmd.cgi?-cmd=" + cmd;
+    private void sendCameraCommand(String lomboEndpoint, String hisnetCmd, Runnable success, Runnable failure) {
+        String url = "lombotech".equals(deviceType)
+                ? apiBaseUrl + lomboEndpoint
+                : apiBaseUrl + "/cgi-bin/hisnet/workmodecmd.cgi?-cmd=" + hisnetCmd;
         httpGet(url, response -> mainHandler.post(success), () -> mainHandler.post(failure));
     }
 
@@ -491,6 +671,7 @@ public class RtspNativePlayerActivity extends Activity {
     private void finishPlayer() {
         if (closed) return;
         closed = true;
+        stopLombotechHeartbeat();
         releasePlayer();
         RtspHlsPlayer.sendStatusToJs("CLOSED", null, false);
         finish();
@@ -509,10 +690,21 @@ public class RtspNativePlayerActivity extends Activity {
         if (playerView != null) {
             playerView.setPlayer(null);
         }
+        if (vlcPlayer != null) {
+            vlcPlayer.stop();
+            vlcPlayer.detachViews();
+            vlcPlayer.release();
+            vlcPlayer = null;
+        }
+        if (libVlc != null) {
+            libVlc.release();
+            libVlc = null;
+        }
     }
 
     @Override
     protected void onDestroy() {
+        stopLombotechHeartbeat();
         if (!closed) {
             finishPlayer();
         } else {

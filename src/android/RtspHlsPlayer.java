@@ -40,6 +40,9 @@ public class RtspHlsPlayer extends CordovaPlugin {
         String title = args.optString(2, "Live");
         String apiBaseUrl = args.optString(3, "");
 
+        boolean forceVlc = args.optBoolean(4, false);
+        String deviceType = args.optString(5, "");
+
         if (frontUrl == null || frontUrl.trim().length() == 0) {
             callbackContext.error("frontUrl is required");
             return;
@@ -52,6 +55,8 @@ public class RtspHlsPlayer extends CordovaPlugin {
         intent.putExtra("rearUrl", rearUrl == null ? "" : rearUrl);
         intent.putExtra("title", title == null || title.length() == 0 ? "Live" : title);
         intent.putExtra("apiBaseUrl", apiBaseUrl == null ? "" : apiBaseUrl);
+        intent.putExtra("forceVlc", forceVlc);
+        intent.putExtra("deviceType", deviceType == null ? "" : deviceType);
 
         cordova.getActivity().startActivity(intent);
         sendStatus("STARTING", null, true);

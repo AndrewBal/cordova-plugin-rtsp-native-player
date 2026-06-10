@@ -23,6 +23,7 @@
         <config-file target="AndroidManifest.xml" parent="/manifest">
             <uses-permission android:name="android.permission.INTERNET" />
             <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+            <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
         </config-file>
 
         <config-file target="AndroidManifest.xml" parent="/manifest/application">
@@ -38,8 +39,10 @@
         <resource-file src="src/android/res/values/rtsp_native_player_styles.xml" target="res/values/rtsp_native_player_styles.xml" />
 
         <framework src="androidx.media3:media3-exoplayer:1.3.1" />
-        <framework src="androidx.media3:media3-exoplayer-rtsp:1.3.1" />
-        <framework src="androidx.media3:media3-ui:1.3.1" />
+        <framework src="androidx.media3:media3-exoplayer-rtsp:1.4.1" />
+        <framework src="androidx.media3:media3-exoplayer-hls:1.4.1" />
+        <framework src="androidx.media3:media3-ui:1.4.1" />
+        <framework src="org.videolan.android:libvlc-all:3.6.0" />
     </platform>
 
     <platform name="ios">
