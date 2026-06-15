@@ -366,7 +366,7 @@ public class RtspNativePlayerActivity extends Activity {
         if (isHls) {
             playerBuilder.setLoadControl(
                     new DefaultLoadControl.Builder()
-                            .setBufferDurationsMs(1500, 4000, 250, 500)
+                            .setBufferDurationsMs(3000, 10000, 750, 1500)
                             .build()
             );
         }
@@ -451,8 +451,12 @@ public class RtspNativePlayerActivity extends Activity {
     }
 
     private void restartPlayback(String url) {
+        restartPlayback(url, 500);
+    }
+
+    private void restartPlayback(String url, long delayMs) {
         showLoading(true);
-        mainHandler.postDelayed(() -> startPlayback(url), 500);
+        mainHandler.postDelayed(() -> startPlayback(url), delayMs);
     }
 
     private void takePhoto() {
@@ -504,12 +508,15 @@ public class RtspNativePlayerActivity extends Activity {
             currentCamera = newCamera;
             cameraLabel.setText("front".equals(currentCamera) ? "Front" : "Rear");
             RtspHlsPlayer.sendActionToJs("CAMERA_SWITCHED", currentCamera, null);
+            long restartDelayMs = "lombotech".equals(deviceType) ? 1200 : 500;
+            Log.i(TAG, "Camera switch OK. Restarting playback in " + restartDelayMs + "ms");
             isSwitchingCamera = false;
-            restartPlayback(frontUrl);
+            restartPlayback(frontUrl, restartDelayMs);
         }), () -> mainHandler.post(() -> {
             showToast("Failed to switch camera");
+            long restartDelayMs = "lombotech".equals(deviceType) ? 1200 : 500;
             isSwitchingCamera = false;
-            restartPlayback(frontUrl);
+            restartPlayback(frontUrl, restartDelayMs);
         }));
     }
 
