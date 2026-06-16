@@ -109,6 +109,12 @@ public class VideoDecoder {
             // an input buffer (dashcams are 720p/1080p).
             format.setInteger(MediaFormat.KEY_MAX_INPUT_SIZE, 1024 * 1024);
 
+            // Enable adaptive playback: this camera's SDP can advertise one resolution
+            // (1280x720) while the actual in-band stream is another (640x360), so the
+            // decoder must re-adapt on the first in-band SPS without a hard reconfigure.
+            format.setInteger(MediaFormat.KEY_MAX_WIDTH, 1920);
+            format.setInteger(MediaFormat.KEY_MAX_HEIGHT, 1088);
+
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
                 format.setInteger(MediaFormat.KEY_LOW_LATENCY, 1);
             }

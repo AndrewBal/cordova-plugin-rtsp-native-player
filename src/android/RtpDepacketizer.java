@@ -79,12 +79,51 @@ public class RtpDepacketizer {
     private void dispatchH264(byte[] p, int off, int len, long ts) {
         int nalType = p[off] & 0x1F;
         if (nalType >= 1 && nalType <= 23) {
-            emit(copy(p, off, len), nalType, ts);
+            emitH264MaybeAggregated(p, off, len, ts);
         } else if (nalType == 24) {
             parseStapA(p, off, len, ts);
         } else if (nalType == 28) {
             parseFuA(p, off, len, ts);
         }
+    }
+
+    // Some cameras (e.g. lombotech/EEASYTECH) pack a whole access unit
+    // (SPS + PPS + IDR) into ONE RTP packet as an Annex-B byte stream with internal
+    // start codes, instead of one NAL per packet (RFC 6184). If we emitted that as a
+    // single NAL it would be mislabeled by its first byte (SPS), and the IDR would
+    // never reach the decoder — only P-frames would, painting over a black frame.
+    // Split on start codes (00 00 01 / 00 00 00 01). Emulation prevention guarantees
+    // these never occur inside a NAL's RBSP, so the split is unambiguous; a normal
+    // single-NAL packet (no internal start codes) is emitted unchanged.
+    private void emitH264MaybeAggregated(byte[] p, int off, int len, long ts) {
+        int end = off + len;
+        int i = off;
+        int lead = startCodeLen(p, i, end);
+        if (lead > 0) i += lead;          // skip a leading start code if present
+        int nalStart = i;
+        while (i < end) {
+            int scl = startCodeLen(p, i, end);
+            if (scl > 0) {
+                if (i > nalStart) emitH264Nal(p, nalStart, i - nalStart, ts);
+                i += scl;
+                nalStart = i;
+            } else {
+                i++;
+            }
+        }
+        if (end > nalStart) emitH264Nal(p, nalStart, end - nalStart, ts);
+    }
+
+    private void emitH264Nal(byte[] p, int off, int len, long ts) {
+        if (len <= 0) return;
+        emit(copy(p, off, len), p[off] & 0x1F, ts);
+    }
+
+    /** Length (3 or 4) of an Annex-B start code at position i, or 0 if none. */
+    private int startCodeLen(byte[] p, int i, int end) {
+        if (i + 3 < end && p[i] == 0 && p[i + 1] == 0 && p[i + 2] == 0 && p[i + 3] == 1) return 4;
+        if (i + 2 < end && p[i] == 0 && p[i + 1] == 0 && p[i + 2] == 1) return 3;
+        return 0;
     }
 
     // STAP-A (RFC 6184 §5.7.1): header byte, then [size16 | NAL]+

@@ -399,13 +399,15 @@ public class RtspNativePlayerActivity extends Activity implements
 
     private void handleH264Nal(byte[] nal, int type, long ts) {
         switch (type) {
-            case 7:  // SPS
-                sps = nal;
-                maybeConfigureDecoder();
+            case 7:  // SPS — keep for the initial csd AND feed it so the decoder can
+                sps = nal;            // adapt to in-band resolution (SDP often lies, e.g.
+                maybeConfigureDecoder();   // advertises 1280x720 while the stream is 640x360)
+                decodeIfReady(nal, ts, false);
                 break;
             case 8:  // PPS
                 pps = nal;
                 maybeConfigureDecoder();
+                decodeIfReady(nal, ts, false);
                 break;
             case 5:  // IDR
                 decodeIfReady(nal, ts, true);
