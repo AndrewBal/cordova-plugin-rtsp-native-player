@@ -73,7 +73,8 @@ public class RtspClient {
     private int cseq = 0;
     private String sessionId;
     private TrackInfo videoTrack;
-    private int rtpChannel = 0;          // interleaved channel the server actually uses for video RTP
+    private int rtpChannel = -1;         // locked once we see video RTP (matched by payload type)
+    private int videoPayloadType = -1;   // RTP payload type of the video track (from SDP m=video)
     private long rtpCount = 0;
 
     // Accumulation buffer for partial TCP reads
@@ -248,6 +249,7 @@ public class RtspClient {
         TrackInfo track = parseSdp(resp);
         if (track == null) throw new Exception("No H.264/H.265 video track in SDP");
         videoTrack = track;
+        videoPayloadType = track.payloadType;
         listener.onTrackInfo(track);
     }
 
@@ -266,14 +268,17 @@ public class RtspClient {
         // With audio as the first SDP track, some servers (live555-style) put video
         // RTP on channel 2-3 even though we asked for 0-1. Reading the wrong channel
         // = no video at all.
+        // NOTE: the announced interleaved channel can't be trusted on this camera — it
+        // echoes interleaved=0-1 but streams video on ch2 (audio=track1 reserves ch0-1).
+        // The real channel is locked in processInterleaved() by matching the video
+        // payload type, so we only log the announcement here.
         Matcher tm = Pattern.compile("interleaved=(\\d+)-(\\d+)").matcher(resp);
         if (tm.find()) {
-            rtpChannel = Integer.parseInt(tm.group(1));
-            Log.i(TAG, "SETUP OK ✓ session=" + sessionId
-                    + " interleaved RTP=ch" + rtpChannel + " RTCP=ch" + tm.group(2));
+            Log.i(TAG, "SETUP OK ✓ session=" + sessionId + " (announced interleaved ch"
+                    + tm.group(1) + "-" + tm.group(2) + "; locking real video channel by payloadType="
+                    + videoPayloadType + ")");
         } else {
-            rtpChannel = 0;
-            Log.i(TAG, "SETUP OK ✓ session=" + sessionId + " (no interleaved in response, assuming ch0)");
+            Log.i(TAG, "SETUP OK ✓ session=" + sessionId);
         }
     }
 
@@ -391,16 +396,30 @@ public class RtspClient {
             System.arraycopy(buf, offset + 4, payload, 0, frameLen);
             offset += 4 + frameLen;
 
-            // Only the video RTP channel feeds the depacketizer; RTCP (rtpChannel+1)
-            // and any other channel are ignored.
-            if (channel == rtpChannel) {
+            // Lock onto the channel that actually carries the video RTP, identified by
+            // the SDP video payload type (RTCP and audio have different PTs / aren't RTP).
+            int pt = -1;
+            boolean looksRtp = false;
+            if (frameLen >= 12) {
+                looksRtp = ((payload[0] >> 6) & 0x03) == 2;   // RTP version == 2
+                pt = payload[1] & 0x7F;
+            }
+            boolean isVideo = looksRtp && (videoPayloadType <= 0 || pt == videoPayloadType);
+
+            if (rtpChannel < 0) {
+                if (isVideo) {
+                    rtpChannel = channel;
+                    Log.i(TAG, "Locked video RTP channel = ch" + channel + " (pt=" + pt + ")");
+                } else {
+                    continue;  // RTCP / audio / control — keep scanning
+                }
+            }
+            if (channel == rtpChannel && isVideo) {
                 rtpCount++;
                 if (rtpCount == 1 || rtpCount % 200 == 0) {
-                    Log.i(TAG, "RTP #" + rtpCount + " ch" + channel + " " + frameLen + "B");
+                    Log.i(TAG, "RTP #" + rtpCount + " ch" + channel + " " + frameLen + "B pt=" + pt);
                 }
                 listener.onRtpPacket(payload, channel);
-            } else if (rtpCount == 0) {
-                Log.i(TAG, "interleaved data on ch" + channel + " (" + frameLen + "B) — not video RTP ch" + rtpChannel);
             }
         }
 
