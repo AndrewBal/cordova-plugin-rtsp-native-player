@@ -3,12 +3,14 @@ package com.andrewbal.rtspnativeplayer;
 import android.app.Activity;
 import android.graphics.Color;
 import android.graphics.drawable.GradientDrawable;
-import android.net.Uri;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
+import android.util.Base64;
 import android.util.Log;
 import android.view.Gravity;
+import android.view.SurfaceHolder;
+import android.view.SurfaceView;
 import android.view.View;
 import android.view.ViewGroup;
 import android.view.Window;
@@ -20,41 +22,33 @@ import android.widget.ProgressBar;
 import android.widget.TextView;
 import android.widget.Toast;
 
-import androidx.media3.common.MediaItem;
-import androidx.media3.common.PlaybackException;
-import androidx.media3.common.Player;
-import androidx.media3.exoplayer.DefaultLoadControl;
-import androidx.media3.exoplayer.DefaultRenderersFactory;
-import androidx.media3.exoplayer.ExoPlayer;
-import androidx.media3.exoplayer.mediacodec.MediaCodecInfo;
-import androidx.media3.exoplayer.mediacodec.MediaCodecSelector;
-import androidx.media3.exoplayer.mediacodec.MediaCodecUtil;
-import androidx.media3.exoplayer.rtsp.RtspMediaSource;
-import androidx.media3.ui.PlayerView;
-
-import org.videolan.libvlc.LibVLC;
-import org.videolan.libvlc.Media;
-import org.videolan.libvlc.MediaPlayer;
-import org.videolan.libvlc.util.VLCVideoLayout;
-
 import java.io.BufferedReader;
 import java.io.InputStream;
 import java.io.InputStreamReader;
 import java.net.HttpURLConnection;
 import java.net.URL;
-import java.util.ArrayList;
-import java.util.List;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
-public class RtspNativePlayerActivity extends Activity {
+/**
+ * RtspNativePlayerActivity — native, zero-buffering RTSP player.
+ *
+ * Mirrors the iOS pipeline (RtspClient → RtpParser → VideoToolbox →
+ * AVSampleBufferDisplayLayer) with the Android equivalents:
+ *   RtspClient (raw TCP/RTSP, interleaved RTP) → RtpDepacketizer →
+ *   VideoDecoder (MediaCodec → Surface, render-on-decode).
+ *
+ * No ExoPlayer, no libVLC, no FFmpeg/HLS — therefore no transcoding and no
+ * jitter buffer. RTP packets are decoded and shown the instant they arrive.
+ */
+public class RtspNativePlayerActivity extends Activity implements
+        RtspClient.Listener, RtpDepacketizer.Listener, VideoDecoder.Listener {
+
     private static final String TAG = "RtspNativePlayer";
-    private static final String MIME_HEVC = "video/hevc";
     private static RtspNativePlayerActivity currentActivity;
 
     private FrameLayout root;
-    private PlayerView playerView;
-    private VLCVideoLayout vlcLayout;
+    private SurfaceView surfaceView;
     private ProgressBar loadingIndicator;
     private TextView statusLabel;
     private TextView cameraLabel;
@@ -62,18 +56,22 @@ public class RtspNativePlayerActivity extends Activity {
     private Button recordButton;
     private Button switchButton;
 
-    // ExoPlayer
-    private ExoPlayer player;
-
-    // libVLC
-    private LibVLC libVlc;
-    private MediaPlayer vlcPlayer;
+    // Native pipeline
+    private volatile RtspClient rtspClient;
+    private volatile RtpDepacketizer depacketizer;
+    private volatile VideoDecoder decoder;
+    private final Object pipelineLock = new Object();
+    private volatile android.view.Surface surface;
+    private volatile boolean surfaceReady = false;
+    private volatile boolean isH265 = false;
+    private volatile boolean decoderConfigured = false;
+    private volatile byte[] sps, pps, vps;
+    private int videoWidth, videoHeight;
 
     private String frontUrl;
     private String rearUrl;
     private String titleText;
     private String apiBaseUrl;
-    private boolean forceVlc;
     private String deviceType;
     private String currentCamera = "front";
     private boolean isRecording = false;
@@ -100,21 +98,14 @@ public class RtspNativePlayerActivity extends Activity {
         rearUrl = getIntent().getStringExtra("rearUrl");
         titleText = getIntent().getStringExtra("title");
         apiBaseUrl = getIntent().getStringExtra("apiBaseUrl");
-        forceVlc = getIntent().getBooleanExtra("forceVlc", false);
         deviceType = getIntent().getStringExtra("deviceType");
         if (deviceType == null) deviceType = "";
-
-        // Lombotech: VLC/live555 dead-ends here — "Unable to determine our source address:
-        // 0.0.0.0" → no RTP → EndReached after ~1 frame (WifiManager IP returns 0 on modern
-        // Samsung, so --miface-addr never applies). ExoPlayer-RTSP (TCP-forced) pulls it fine.
-        if ("lombotech".equals(deviceType)) {
-            forceVlc = false;
-        }
 
         if (titleText == null || titleText.length() == 0) titleText = "Live";
         if (apiBaseUrl == null || apiBaseUrl.length() == 0) apiBaseUrl = "http://192.168.0.1";
 
-        Log.i(TAG, "Starting player. frontUrl=" + frontUrl + ", rearUrl=" + rearUrl + ", apiBaseUrl=" + apiBaseUrl + ", forceVlc=" + forceVlc);
+        Log.i(TAG, "Starting native player. frontUrl=" + frontUrl + ", rearUrl=" + rearUrl
+                + ", apiBaseUrl=" + apiBaseUrl + ", deviceType=" + deviceType);
 
         buildUi();
         if ("lombotech".equals(deviceType)) {
@@ -123,7 +114,7 @@ public class RtspNativePlayerActivity extends Activity {
         if ("lombotech".equals(deviceType) || (rearUrl != null && rearUrl.length() > 0)) {
             checkCameraCount();
         }
-        startPlayback(frontUrl);
+        // Playback starts in surfaceCreated() once we have a valid Surface.
     }
 
     private void hideSystemUi() {
@@ -145,21 +136,36 @@ public class RtspNativePlayerActivity extends Activity {
                 ViewGroup.LayoutParams.MATCH_PARENT
         ));
 
-        if (forceVlc) {
-            vlcLayout = new VLCVideoLayout(this);
-            root.addView(vlcLayout, new FrameLayout.LayoutParams(
-                    ViewGroup.LayoutParams.MATCH_PARENT,
-                    ViewGroup.LayoutParams.MATCH_PARENT
-            ));
-        } else {
-            playerView = new PlayerView(this);
-            playerView.setUseController(false);
-            playerView.setResizeMode(androidx.media3.ui.AspectRatioFrameLayout.RESIZE_MODE_FIT);
-            root.addView(playerView, new FrameLayout.LayoutParams(
-                    ViewGroup.LayoutParams.MATCH_PARENT,
-                    ViewGroup.LayoutParams.MATCH_PARENT
-            ));
-        }
+        surfaceView = new SurfaceView(this);
+        FrameLayout.LayoutParams surfaceParams = new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.MATCH_PARENT);
+        surfaceParams.gravity = Gravity.CENTER;
+        root.addView(surfaceView, surfaceParams);
+        surfaceView.getHolder().addCallback(new SurfaceHolder.Callback() {
+            @Override
+            public void surfaceCreated(SurfaceHolder holder) {
+                surface = holder.getSurface();
+                surfaceReady = true;
+                if (!closed && rtspClient == null) {
+                    startPipeline(frontUrl);
+                } else {
+                    maybeConfigureDecoder();
+                }
+            }
+
+            @Override
+            public void surfaceChanged(SurfaceHolder holder, int format, int width, int height) {
+                surface = holder.getSurface();
+            }
+
+            @Override
+            public void surfaceDestroyed(SurfaceHolder holder) {
+                surfaceReady = false;
+                surface = null;
+                stopPipeline();
+            }
+        });
 
         loadingIndicator = new ProgressBar(this);
         FrameLayout.LayoutParams progressParams = new FrameLayout.LayoutParams(dp(52), dp(52));
@@ -276,188 +282,211 @@ public class RtspNativePlayerActivity extends Activity {
         return drawable;
     }
 
-    private void startPlayback(String url) {
+    // ────────────────────────────────────────────────
+    //  Native pipeline lifecycle
+    // ────────────────────────────────────────────────
+
+    private void startPipeline(String url) {
+        synchronized (pipelineLock) {
+            if (rtspClient != null) return;
+            decoderConfigured = false;
+            sps = pps = vps = null;
+            isH265 = false;
+            depacketizer = new RtpDepacketizer(this);
+            rtspClient = new RtspClient(getApplicationContext(), url, this);
+            rtspClient.start();
+        }
         setStatus("CONNECTING", null, "Connecting...");
         showLoading(true);
-        releasePlayer();
+    }
 
-        if (forceVlc) {
-            startVlcPlayback(url);
-        } else {
-            startExoPlayback(url);
+    private void stopPipeline() {
+        RtspClient client;
+        VideoDecoder dec;
+        synchronized (pipelineLock) {
+            client = rtspClient;
+            dec = decoder;
+            rtspClient = null;
+            decoder = null;
+            depacketizer = null;
+            decoderConfigured = false;
+            sps = pps = vps = null;
+        }
+        if (client != null) client.stop();
+        if (dec != null) dec.release();
+    }
+
+    private void maybeConfigureDecoder() {
+        synchronized (pipelineLock) {
+            if (decoder == null || decoderConfigured || !surfaceReady || surface == null) return;
+            if (sps == null || pps == null) return;
+            if (isH265 && vps == null) return;
+            boolean ok = decoder.configure(surface, vps, sps, pps);
+            decoderConfigured = ok;
+            if (ok) Log.i(TAG, "Decoder configured (" + (isH265 ? "H265" : "H264") + ")");
         }
     }
 
-    private void startVlcPlayback(String url) {
-        Log.i(TAG, "startVlcPlayback url=" + url);
-        ArrayList<String> vlcOptions = new ArrayList<>();
-        vlcOptions.add("--rtsp-tcp");
-        vlcOptions.add("--network-caching=300");
+    // ── RtspClient.Listener ──────────────────────────
 
-        // live555 iterates all interfaces and hits dummy ones with 0.0.0.0, causing
-        // RTCP keepalive failures (camera drops session at ~10s). Fix: force Wi-Fi IP.
+    @Override
+    public void onConnecting() {
+        setStatus("CONNECTING", null, "Connecting...");
+    }
+
+    @Override
+    public void onPlaying() {
+        setStatus("BUFFERING", null, "Receiving stream...");
+    }
+
+    @Override
+    public void onTrackInfo(RtspClient.TrackInfo info) {
+        String codec = info.codec != null ? info.codec.toUpperCase() : "H264";
+        isH265 = codec.equals("H265") || codec.equals("HEVC");
+        synchronized (pipelineLock) {
+            if (depacketizer != null) depacketizer.setH265(isH265);
+            decoder = new VideoDecoder(isH265, this);
+        }
+        // Seed param sets from SDP if present (in-band NALs still override/confirm).
+        if (isH265) {
+            if (info.spropVps != null) vps = decodeB64(info.spropVps);
+            if (info.spropSps != null) sps = decodeB64(info.spropSps);
+            if (info.spropPps != null) pps = decodeB64(info.spropPps);
+        } else if (info.spropParameterSets != null) {
+            String[] parts = info.spropParameterSets.split(",");
+            if (parts.length >= 1) sps = decodeB64(parts[0]);
+            if (parts.length >= 2) pps = decodeB64(parts[1]);
+        }
+        maybeConfigureDecoder();
+    }
+
+    @Override
+    public void onRtpPacket(byte[] payload, int channel) {
+        if (channel == 0) {
+            RtpDepacketizer d = depacketizer;
+            if (d != null) d.feed(payload);
+        }
+    }
+
+    @Override
+    public void onError(String message) {
+        Log.e(TAG, "Pipeline error: " + message);
+        showStatusText("Stream error");
+        RtspHlsPlayer.sendErrorToJs(message);
+    }
+
+    @Override
+    public void onEnded() {
+        Log.w(TAG, "Stream ended");
+        showStatusText("Stream ended");
+    }
+
+    // ── RtpDepacketizer.Listener ─────────────────────
+
+    @Override
+    public void onNalUnit(byte[] nal, int type, long timestamp) {
+        if (isH265) {
+            handleH265Nal(nal, type, timestamp);
+        } else {
+            handleH264Nal(nal, type, timestamp);
+        }
+    }
+
+    private void handleH264Nal(byte[] nal, int type, long ts) {
+        switch (type) {
+            case 7:  // SPS
+                sps = nal;
+                maybeConfigureDecoder();
+                break;
+            case 8:  // PPS
+                pps = nal;
+                maybeConfigureDecoder();
+                break;
+            case 5:  // IDR
+                decodeIfReady(nal, ts, true);
+                break;
+            case 1:  // non-IDR slice
+                decodeIfReady(nal, ts, false);
+                break;
+            default:
+                break;  // SEI/etc. — ignore
+        }
+    }
+
+    private void handleH265Nal(byte[] nal, int type, long ts) {
+        switch (type) {
+            case 32:  // VPS
+                vps = nal;
+                maybeConfigureDecoder();
+                break;
+            case 33:  // SPS
+                sps = nal;
+                maybeConfigureDecoder();
+                break;
+            case 34:  // PPS
+                pps = nal;
+                maybeConfigureDecoder();
+                break;
+            case 19:  // IDR_W_RADL
+            case 20:  // IDR_N_LP
+            case 21:  // CRA
+                decodeIfReady(nal, ts, true);
+                break;
+            case 39:  // PREFIX_SEI
+            case 40:  // SUFFIX_SEI
+                break;
+            default:
+                if (type <= 31) decodeIfReady(nal, ts, false);
+                break;
+        }
+    }
+
+    private void decodeIfReady(byte[] nal, long ts, boolean keyframe) {
+        VideoDecoder d = decoder;
+        if (decoderConfigured && d != null) d.decode(nal, ts, keyframe);
+    }
+
+    // ── VideoDecoder.Listener ────────────────────────
+
+    @Override
+    public void onFirstFrame() {
+        setStatus("PLAYING", null, "");
+        showLoading(false);
+    }
+
+    @Override
+    public void onVideoSize(int width, int height) {
+        videoWidth = width;
+        videoHeight = height;
+        applyAspect();
+    }
+
+    private void applyAspect() {
+        mainHandler.post(() -> {
+            if (videoWidth <= 0 || videoHeight <= 0 || root == null || surfaceView == null) return;
+            int rw = root.getWidth();
+            int rh = root.getHeight();
+            if (rw <= 0 || rh <= 0) return;
+            float scale = Math.min((float) rw / videoWidth, (float) rh / videoHeight);
+            int w = Math.round(videoWidth * scale);
+            int h = Math.round(videoHeight * scale);
+            FrameLayout.LayoutParams lp = new FrameLayout.LayoutParams(w, h);
+            lp.gravity = Gravity.CENTER;
+            surfaceView.setLayoutParams(lp);
+        });
+    }
+
+    private byte[] decodeB64(String s) {
         try {
-            android.net.wifi.WifiManager wm = (android.net.wifi.WifiManager)
-                    getApplicationContext().getSystemService(android.content.Context.WIFI_SERVICE);
-            if (wm != null) {
-                int ipInt = wm.getConnectionInfo().getIpAddress();
-                if (ipInt != 0) {
-                    String ipStr = String.format(java.util.Locale.US, "%d.%d.%d.%d",
-                            ipInt & 0xff, (ipInt >> 8) & 0xff,
-                            (ipInt >> 16) & 0xff, (ipInt >> 24) & 0xff);
-                    vlcOptions.add("--miface-addr=" + ipStr);
-                    Log.i(TAG, "VLC RTCP bind IP: " + ipStr);
-                }
-            }
+            return Base64.decode(s.trim(), Base64.DEFAULT);
         } catch (Exception e) {
-            Log.w(TAG, "VLC RTCP bind: failed to get Wi-Fi IP: " + e.getMessage());
+            return null;
         }
-
-        libVlc = new LibVLC(this, vlcOptions);
-        vlcPlayer = new MediaPlayer(libVlc);
-        vlcPlayer.attachViews(vlcLayout, null, false, false);
-
-        Media media = new Media(libVlc, Uri.parse(url));
-        media.addOption(":network-caching=300");
-        media.addOption(":no-audio");
-        vlcPlayer.setMedia(media);
-        media.release();
-
-        vlcPlayer.setEventListener(event -> {
-            switch (event.type) {
-                case MediaPlayer.Event.Buffering:
-                    mainHandler.post(() -> {
-                        setStatus("BUFFERING", null, "Buffering...");
-                        showLoading(true);
-                    });
-                    break;
-                case MediaPlayer.Event.Playing:
-                    mainHandler.post(() -> {
-                        setStatus("PLAYING", null, "");
-                        showLoading(false);
-                    });
-                    break;
-                case MediaPlayer.Event.EncounteredError:
-                    Log.e(TAG, "VLC EncounteredError");
-                    mainHandler.post(() -> {
-                        showStatusText("Stream error");
-                        RtspHlsPlayer.sendErrorToJs("VLC stream error");
-                    });
-                    break;
-                case MediaPlayer.Event.EndReached:
-                    Log.w(TAG, "VLC EndReached (stream stopped or timed out)");
-                    mainHandler.post(() -> showStatusText("Stream ended"));
-                    break;
-            }
-        });
-
-        vlcPlayer.play();
     }
 
-    private void startExoPlayback(String url) {
-        DefaultRenderersFactory renderersFactory = new DefaultRenderersFactory(this)
-                .forceDisableMediaCodecAsynchronousQueueing()
-                .setEnableDecoderFallback(true)
-                .setMediaCodecSelector(this::selectDecoders);
-        boolean isHls = url != null && (url.contains(".m3u8") || url.startsWith("file://"));
-        ExoPlayer.Builder playerBuilder = new ExoPlayer.Builder(this)
-                .setRenderersFactory(renderersFactory);
-
-        if (isHls) {
-            playerBuilder.setLoadControl(
-                    new DefaultLoadControl.Builder()
-                            .setBufferDurationsMs(3000, 10000, 750, 1500)
-                            .build()
-            );
-        }
-
-        player = playerBuilder.build();
-        playerView.setPlayer(player);
-
-        MediaItem mediaItem = MediaItem.fromUri(Uri.parse(url));
-        if (isHls) {
-            // FFmpeg→HLS (Lombotech): H.264-SDP камеры без sprop-parameter-sets, чего
-            // Media3-RTSP требует и падает; FFmpeg это терпит. Играем локальный m3u8 как HLS.
-            player.setMediaItem(mediaItem);
-        } else {
-            RtspMediaSource.Factory factory = new RtspMediaSource.Factory()
-                    .setForceUseRtpTcp(true)
-                    .setTimeoutMs(15000);
-            player.setMediaSource(factory.createMediaSource(mediaItem));
-        }
-        player.addListener(new Player.Listener() {
-            @Override
-            public void onPlaybackStateChanged(int playbackState) {
-                if (playbackState == Player.STATE_BUFFERING) {
-                    setStatus("BUFFERING", null, "Buffering...");
-                    showLoading(true);
-                } else if (playbackState == Player.STATE_READY) {
-                    setStatus("PLAYING", null, "");
-                    showLoading(false);
-                } else if (playbackState == Player.STATE_ENDED) {
-                    showStatusText("Stream ended");
-                }
-            }
-
-            @Override
-            public void onPlayerError(PlaybackException error) {
-                Log.e(TAG, "Playback error", error);
-                showStatusText("Error: " + error.getMessage());
-                RtspHlsPlayer.sendErrorToJs(error.getMessage());
-            }
-        });
-        player.prepare();
-        player.play();
-    }
-
-    private List<MediaCodecInfo> selectDecoders(String mimeType,
-                                                boolean requiresSecureDecoder,
-                                                boolean requiresTunnelingDecoder) throws MediaCodecUtil.DecoderQueryException {
-        List<MediaCodecInfo> decoders = MediaCodecSelector.DEFAULT.getDecoderInfos(
-                mimeType,
-                requiresSecureDecoder,
-                requiresTunnelingDecoder
-        );
-
-        if (!MIME_HEVC.equals(mimeType) || decoders.size() <= 1) {
-            Log.i(TAG, "Decoders for " + mimeType + ": " + codecNames(decoders));
-            return decoders;
-        }
-
-        ArrayList<MediaCodecInfo> preferred = new ArrayList<>();
-        ArrayList<MediaCodecInfo> exynosC2 = new ArrayList<>();
-
-        for (MediaCodecInfo decoder : decoders) {
-            String name = decoder.name == null ? "" : decoder.name.toLowerCase();
-            if (name.contains("c2.exynos")) {
-                exynosC2.add(decoder);
-            } else {
-                preferred.add(decoder);
-            }
-        }
-
-        preferred.addAll(exynosC2);
-        Log.i(TAG, "HEVC decoder order: " + codecNames(preferred));
-        return preferred;
-    }
-
-    private String codecNames(List<MediaCodecInfo> decoders) {
-        StringBuilder builder = new StringBuilder();
-        for (int i = 0; i < decoders.size(); i++) {
-            if (i > 0) builder.append(", ");
-            builder.append(decoders.get(i).name);
-        }
-        return builder.toString();
-    }
-
-    private void restartPlayback(String url) {
-        restartPlayback(url, 500);
-    }
-
-    private void restartPlayback(String url, long delayMs) {
-        showLoading(true);
-        mainHandler.postDelayed(() -> startPlayback(url), delayMs);
-    }
+    // ────────────────────────────────────────────────
+    //  Camera controls (HTTP) — unchanged from the prior engine
+    // ────────────────────────────────────────────────
 
     private void takePhoto() {
         showToast("Taking photo...");
@@ -499,7 +528,7 @@ public class RtspNativePlayerActivity extends Activity {
         showToast("Switching camera...");
         setStatus("SWITCHING_CAMERA", newCamera, "Switching camera...");
         showLoading(true);
-        releasePlayer();
+        stopPipeline();
 
         String switchUrl = "lombotech".equals(deviceType)
                 ? apiBaseUrl + "/app/setparamvalue?param=switchcam&value=" + camId
@@ -509,22 +538,20 @@ public class RtspNativePlayerActivity extends Activity {
             cameraLabel.setText("front".equals(currentCamera) ? "Front" : "Rear");
             RtspHlsPlayer.sendActionToJs("CAMERA_SWITCHED", currentCamera, null);
             long restartDelayMs = "lombotech".equals(deviceType) ? 1200 : 500;
-            Log.i(TAG, "Camera switch OK. Restarting playback in " + restartDelayMs + "ms");
+            Log.i(TAG, "Camera switch OK. Restarting pipeline in " + restartDelayMs + "ms");
             isSwitchingCamera = false;
-            restartPlayback(frontUrl, restartDelayMs);
+            mainHandler.postDelayed(() -> { if (!closed) startPipeline(frontUrl); }, restartDelayMs);
         }), () -> mainHandler.post(() -> {
             showToast("Failed to switch camera");
             long restartDelayMs = "lombotech".equals(deviceType) ? 1200 : 500;
             isSwitchingCamera = false;
-            restartPlayback(frontUrl, restartDelayMs);
+            mainHandler.postDelayed(() -> { if (!closed) startPipeline(frontUrl); }, restartDelayMs);
         }));
     }
 
-    // Lombotech RTSP keepalive: GET /app/getparamvalue?param=rec живет в нативной
-    // activity, потому что WebView уходит в background. Отдельный TCP-push socket
-    // на :5000 для HLS-режима не нужен и только добавляет лишнюю нестабильность.
-    // Камера рвёт RTSP-сессию через ~10с без heartbeat. WebView на паузе, пока эта Activity
-    // на переднем плане, поэтому JS-таймер задросселило бы — heartbeat обязан жить тут, нативно.
+    // Lombotech RTSP keepalive lives in the native activity because the WebView is
+    // paused while this Activity is foregrounded; the camera drops the RTSP session
+    // after ~10s without a heartbeat.
     private Handler heartbeatHandler;
     private Runnable heartbeatRunnable;
 
@@ -651,6 +678,10 @@ public class RtspNativePlayerActivity extends Activity {
         return builder.toString();
     }
 
+    // ────────────────────────────────────────────────
+    //  Status / UI helpers
+    // ────────────────────────────────────────────────
+
     private void setStatus(String value, String message, String uiText) {
         RtspHlsPlayer.sendStatusToJs(value, message, true);
         showStatusText(uiText);
@@ -679,7 +710,7 @@ public class RtspNativePlayerActivity extends Activity {
         if (closed) return;
         closed = true;
         stopLombotechHeartbeat();
-        releasePlayer();
+        stopPipeline();
         RtspHlsPlayer.sendStatusToJs("CLOSED", null, false);
         finish();
     }
@@ -688,34 +719,13 @@ public class RtspNativePlayerActivity extends Activity {
         mainHandler.post(this::finishPlayer);
     }
 
-    private void releasePlayer() {
-        if (player != null) {
-            player.stop();
-            player.release();
-            player = null;
-        }
-        if (playerView != null) {
-            playerView.setPlayer(null);
-        }
-        if (vlcPlayer != null) {
-            vlcPlayer.stop();
-            vlcPlayer.detachViews();
-            vlcPlayer.release();
-            vlcPlayer = null;
-        }
-        if (libVlc != null) {
-            libVlc.release();
-            libVlc = null;
-        }
-    }
-
     @Override
     protected void onDestroy() {
         stopLombotechHeartbeat();
         if (!closed) {
             finishPlayer();
         } else {
-            releasePlayer();
+            stopPipeline();
         }
         executor.shutdownNow();
         if (currentActivity == this) currentActivity = null;
