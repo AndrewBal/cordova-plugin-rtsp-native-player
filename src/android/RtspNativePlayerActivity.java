@@ -362,10 +362,9 @@ public class RtspNativePlayerActivity extends Activity implements
 
     @Override
     public void onRtpPacket(byte[] payload, int channel) {
-        if (channel == 0) {
-            RtpDepacketizer d = depacketizer;
-            if (d != null) d.feed(payload);
-        }
+        // RtspClient already filtered to the negotiated video RTP channel.
+        RtpDepacketizer d = depacketizer;
+        if (d != null) d.feed(payload);
     }
 
     @Override
@@ -383,8 +382,14 @@ public class RtspNativePlayerActivity extends Activity implements
 
     // ── RtpDepacketizer.Listener ─────────────────────
 
+    private int nalLogCount = 0;
+
     @Override
     public void onNalUnit(byte[] nal, int type, long timestamp) {
+        if (nalLogCount < 12) {
+            nalLogCount++;
+            Log.i(TAG, "NAL type=" + type + " len=" + nal.length + " (configured=" + decoderConfigured + ")");
+        }
         if (isH265) {
             handleH265Nal(nal, type, timestamp);
         } else {

@@ -73,6 +73,8 @@ public class RtspClient {
     private int cseq = 0;
     private String sessionId;
     private TrackInfo videoTrack;
+    private int rtpChannel = 0;          // interleaved channel the server actually uses for video RTP
+    private long rtpCount = 0;
 
     // Accumulation buffer for partial TCP reads
     private final ByteArrayOutputStream acc = new ByteArrayOutputStream(65536);
@@ -259,7 +261,20 @@ public class RtspClient {
 
         Matcher m = Pattern.compile("Session:\\s*([^;\\r\\n]+)").matcher(resp);
         if (m.find()) sessionId = m.group(1).trim();
-        Log.i(TAG, "SETUP OK ✓ session=" + sessionId);
+
+        // Use the interleaved channel the SERVER assigned, not the one we requested.
+        // With audio as the first SDP track, some servers (live555-style) put video
+        // RTP on channel 2-3 even though we asked for 0-1. Reading the wrong channel
+        // = no video at all.
+        Matcher tm = Pattern.compile("interleaved=(\\d+)-(\\d+)").matcher(resp);
+        if (tm.find()) {
+            rtpChannel = Integer.parseInt(tm.group(1));
+            Log.i(TAG, "SETUP OK ✓ session=" + sessionId
+                    + " interleaved RTP=ch" + rtpChannel + " RTCP=ch" + tm.group(2));
+        } else {
+            rtpChannel = 0;
+            Log.i(TAG, "SETUP OK ✓ session=" + sessionId + " (no interleaved in response, assuming ch0)");
+        }
     }
 
     private void handshakePlay() throws Exception {
@@ -376,7 +391,17 @@ public class RtspClient {
             System.arraycopy(buf, offset + 4, payload, 0, frameLen);
             offset += 4 + frameLen;
 
-            listener.onRtpPacket(payload, channel);
+            // Only the video RTP channel feeds the depacketizer; RTCP (rtpChannel+1)
+            // and any other channel are ignored.
+            if (channel == rtpChannel) {
+                rtpCount++;
+                if (rtpCount == 1 || rtpCount % 200 == 0) {
+                    Log.i(TAG, "RTP #" + rtpCount + " ch" + channel + " " + frameLen + "B");
+                }
+                listener.onRtpPacket(payload, channel);
+            } else if (rtpCount == 0) {
+                Log.i(TAG, "interleaved data on ch" + channel + " (" + frameLen + "B) — not video RTP ch" + rtpChannel);
+            }
         }
 
         // Keep unconsumed tail

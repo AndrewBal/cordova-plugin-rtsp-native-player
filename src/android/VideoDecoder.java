@@ -71,6 +71,11 @@ public class VideoDecoder {
      */
     public boolean configure(Surface surface, byte[] vps, byte[] sps, byte[] pps) {
         if (surface == null || sps == null || pps == null) return false;
+        // Some cameras embed an Annex-B start code inside SDP sprop-parameter-sets.
+        // Strip it so the csd ends up with exactly one start code, not two.
+        vps = stripStartCode(vps);
+        sps = stripStartCode(sps);
+        pps = stripStartCode(pps);
         try {
             String mime = isH265 ? MediaFormat.MIMETYPE_VIDEO_HEVC : MediaFormat.MIMETYPE_VIDEO_AVC;
             // Placeholder dimensions — the real size comes from the csd/SPS and the
@@ -220,6 +225,22 @@ public class VideoDecoder {
                 }
             }
         }
+    }
+
+    /** Remove a leading Annex-B start code (00 00 00 01 or 00 00 01) if present. */
+    private static byte[] stripStartCode(byte[] nal) {
+        if (nal == null) return null;
+        if (nal.length >= 4 && nal[0] == 0 && nal[1] == 0 && nal[2] == 0 && nal[3] == 1) {
+            byte[] out = new byte[nal.length - 4];
+            System.arraycopy(nal, 4, out, 0, out.length);
+            return out;
+        }
+        if (nal.length >= 3 && nal[0] == 0 && nal[1] == 0 && nal[2] == 1) {
+            byte[] out = new byte[nal.length - 3];
+            System.arraycopy(nal, 3, out, 0, out.length);
+            return out;
+        }
+        return nal;
     }
 
     public void release() {
