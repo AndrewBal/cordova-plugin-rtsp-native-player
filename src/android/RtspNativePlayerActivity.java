@@ -111,7 +111,11 @@ public class RtspNativePlayerActivity extends Activity implements
         if ("lombotech".equals(deviceType)) {
             startLombotechHeartbeat();
         }
-        if ("lombotech".equals(deviceType) || (rearUrl != null && rearUrl.length() > 0)) {
+        if (isUrlSwitch()) {
+            // URL-based dual-cam (e.g. TF808 ch00/ch01): rear is a distinct stream URL,
+            // and there is no getcamnum CGI — show the switch control directly.
+            showSwitchControls();
+        } else if ("lombotech".equals(deviceType) || (rearUrl != null && rearUrl.length() > 0)) {
             checkCameraCount();
         }
         // Playback starts in surfaceCreated() once we have a valid Surface.
@@ -148,7 +152,7 @@ public class RtspNativePlayerActivity extends Activity implements
                 surface = holder.getSurface();
                 surfaceReady = true;
                 if (!closed && rtspClient == null) {
-                    startPipeline(frontUrl);
+                    startPipeline(currentPlayUrl());
                 } else {
                     maybeConfigureDecoder();
                 }
@@ -285,6 +289,25 @@ public class RtspNativePlayerActivity extends Activity implements
     // ────────────────────────────────────────────────
     //  Native pipeline lifecycle
     // ────────────────────────────────────────────────
+
+
+
+    /** True when front/rear are distinct stream URLs (e.g. TF808 ch00/ch01): switch by URL, no HTTP. */
+    private boolean isUrlSwitch() {
+        return rearUrl != null && rearUrl.length() > 0 && !rearUrl.equals(frontUrl);
+    }
+
+    private String currentPlayUrl() {
+        return ("rear".equals(currentCamera) && isUrlSwitch()) ? rearUrl : frontUrl;
+    }
+
+    private void showSwitchControls() {
+        mainHandler.post(() -> {
+            switchButton.setVisibility(View.VISIBLE);
+            cameraLabel.setVisibility(View.VISIBLE);
+        });
+    }
+
 
     private void startPipeline(String url) {
         synchronized (pipelineLock) {
@@ -499,30 +522,44 @@ public class RtspNativePlayerActivity extends Activity implements
         showToast("Taking photo...");
         RtspHlsPlayer.sendActionToJs("PHOTO", currentCamera, null);
 
-        sendCameraCommand("/app/snapshot", "trigger", () -> {
+        Runnable onOk = () -> {
             showToast("Photo saved!");
             RtspHlsPlayer.sendActionToJs("PHOTO_SUCCESS", currentCamera, null);
-        }, () -> {
+        };
+        Runnable onFail = () -> {
             showToast("Photo failed");
             RtspHlsPlayer.sendActionToJs("PHOTO_FAILED", currentCamera, null);
-        });
+        };
+
+        if ("tf808".equals(deviceType)) {
+            tf808Cmd(1101, 0, onOk, onFail);   // NET_CMD_REMOTETAKEPHOTO
+            return;
+        }
+        sendCameraCommand("/app/snapshot", "trigger", onOk, onFail);
     }
 
     private void toggleRecording() {
         boolean start = !isRecording;
         showToast(start ? "Starting..." : "Stopping...");
 
+        Runnable onOk = () -> {
+            isRecording = start;
+            recordingIndicator.setVisibility(isRecording ? View.VISIBLE : View.GONE);
+            recordButton.setTextColor(isRecording ? Color.WHITE : Color.BLACK);
+            recordButton.setBackground(makeRoundedBg(isRecording ? Color.RED : Color.WHITE, dp(30)));
+            showToast(start ? "Recording" : "Stopped");
+            RtspHlsPlayer.sendActionToJs(start ? "RECORD_START" : "RECORD_STOP", currentCamera, null);
+        };
+        Runnable onFail = () -> showToast("Failed");
+
+        if ("tf808".equals(deviceType)) {
+            tf808Cmd(1100, start ? 1 : 0, onOk, onFail);   // NET_CMD_REMOTERECORD_SWITCH
+            return;
+        }
         sendCameraCommand(
             start ? "/app/setparamvalue?param=rec&value=1" : "/app/setparamvalue?param=rec&value=0",
             start ? "start" : "stop",
-            () -> {
-                isRecording = start;
-                recordingIndicator.setVisibility(isRecording ? View.VISIBLE : View.GONE);
-                recordButton.setTextColor(isRecording ? Color.WHITE : Color.BLACK);
-                recordButton.setBackground(makeRoundedBg(isRecording ? Color.RED : Color.WHITE, dp(30)));
-                showToast(start ? "Recording" : "Stopped");
-                RtspHlsPlayer.sendActionToJs(start ? "RECORD_START" : "RECORD_STOP", currentCamera, null);
-            }, () -> showToast("Failed"));
+            onOk, onFail);
     }
 
     private void switchCamera() {
@@ -530,13 +567,24 @@ public class RtspNativePlayerActivity extends Activity implements
 
         isSwitchingCamera = true;
         String newCamera = "front".equals(currentCamera) ? "rear" : "front";
-        int camId = "front".equals(newCamera) ? 0 : 1;
 
         showToast("Switching camera...");
         setStatus("SWITCHING_CAMERA", newCamera, "Switching camera...");
         showLoading(true);
         stopPipeline();
 
+        if (isUrlSwitch()) {
+            // TF808 & co: switch = TEARDOWN current + PLAY the other ch URL. No HTTP command.
+            currentCamera = newCamera;
+            cameraLabel.setText("front".equals(currentCamera) ? "Front" : "Rear");
+            RtspHlsPlayer.sendActionToJs("CAMERA_SWITCHED", currentCamera, null);
+            Log.i(TAG, "Camera switch (URL) -> " + newCamera + " " + currentPlayUrl());
+            isSwitchingCamera = false;
+            mainHandler.postDelayed(() -> { if (!closed) startPipeline(currentPlayUrl()); }, 300);
+            return;
+        }
+
+        int camId = "front".equals(newCamera) ? 0 : 1;
         String switchUrl = "lombotech".equals(deviceType)
                 ? apiBaseUrl + "/app/setparamvalue?param=switchcam&value=" + camId
                 : apiBaseUrl + "/cgi-bin/hisnet/getcamchnl.cgi?&-camid=" + camId;
@@ -643,7 +691,17 @@ public class RtspNativePlayerActivity extends Activity implements
         void onSuccess(String response);
     }
 
+    // TF808/V536 cmd API: set commands are POST to :8082 with params in the query string.
+    private void tf808Cmd(int cmd, int par, Runnable success, Runnable failure) {
+        String url = apiBaseUrl + "/api/setdeviceinfo/?custom=1&cmd=" + cmd + "&par=" + par;
+        httpRequest("POST", url, response -> mainHandler.post(success), () -> mainHandler.post(failure));
+    }
+
     private void httpGet(String urlString, HttpSuccess success, Runnable failure) {
+        httpRequest("GET", urlString, success, failure);
+    }
+
+    private void httpRequest(String method, String urlString, HttpSuccess success, Runnable failure) {
         executor.execute(() -> {
             HttpURLConnection connection = null;
             try {
@@ -652,7 +710,11 @@ public class RtspNativePlayerActivity extends Activity implements
                 connection.setConnectTimeout(5000);
                 connection.setReadTimeout(5000);
                 connection.setUseCaches(false);
-                connection.setRequestMethod("GET");
+                connection.setRequestMethod(method);
+                if ("POST".equals(method)) {
+                    connection.setDoOutput(true);
+                    connection.getOutputStream().close();  // empty body; params live in the query string
+                }
 
                 int code = connection.getResponseCode();
                 InputStream inputStream = code >= 200 && code < 300
