@@ -365,23 +365,36 @@
             });
         }
         
-        // Check if we have a complete RTSP response
-        NSString *bufferStr = [[NSString alloc] initWithData:self.readBuffer encoding:NSUTF8StringEncoding];
-        if (!bufferStr) {
-            // Binary data arrived (shouldn't happen before PLAY), keep reading
+        // Find the end of the RTSP header (\r\n\r\n) by scanning the RAW BYTES.
+        //
+        // We must NOT decode the whole buffer to a string first: after PLAY the
+        // camera immediately streams binary interleaved RTP frames, and they very
+        // often arrive coalesced with the PLAY response in the same TCP read. A
+        // whole-buffer UTF-8 decode of [ASCII header][binary RTP] returns nil,
+        // which previously sent this method into an endless read loop — the PLAY
+        // response was never parsed, the state never reached Playing, and the
+        // stream hung on "Connecting" forever. (The Android client already does
+        // this byte-level scan, which is why Android was unaffected.)
+        const uint8_t *bufBytes = (const uint8_t *)self.readBuffer.bytes;
+        NSUInteger bufLen = self.readBuffer.length;
+        NSInteger headerEndLoc = -1;   // offset of the first '\r' in "\r\n\r\n"
+        for (NSUInteger i = 0; i + 4 <= bufLen; i++) {
+            if (bufBytes[i] == '\r' && bufBytes[i + 1] == '\n' &&
+                bufBytes[i + 2] == '\r' && bufBytes[i + 3] == '\n') {
+                headerEndLoc = (NSInteger)i;
+                break;
+            }
+        }
+
+        if (headerEndLoc < 0) {
+            // Header not complete yet, keep reading
             [self readRtspResponse:completion];
             return;
         }
-        
-        NSRange headerEnd = [bufferStr rangeOfString:@"\r\n\r\n"];
-        if (headerEnd.location == NSNotFound) {
-            // Incomplete response, keep reading
-            [self readRtspResponse:completion];
-            return;
-        }
-        
-        // Check for Content-Length to read body
-        NSString *headers = [bufferStr substringToIndex:headerEnd.location];
+
+        // Decode ONLY the header bytes (always ASCII) to look for Content-Length.
+        NSData *headerData = [self.readBuffer subdataWithRange:NSMakeRange(0, (NSUInteger)headerEndLoc)];
+        NSString *headers = [[NSString alloc] initWithData:headerData encoding:NSASCIIStringEncoding] ?: @"";
         NSInteger contentLength = 0;
         NSRegularExpression *clRegex = [NSRegularExpression regularExpressionWithPattern:@"Content-[Ll]ength:\\s*(\\d+)"
                                                                                 options:0 error:nil];
@@ -390,18 +403,20 @@
         if (clMatch) {
             contentLength = [[headers substringWithRange:[clMatch rangeAtIndex:1]] integerValue];
         }
-        
-        NSInteger totalNeeded = headerEnd.location + 4 + contentLength;
-        
+
+        NSInteger totalNeeded = headerEndLoc + 4 + contentLength;
+
         if ((NSInteger)self.readBuffer.length < totalNeeded) {
             // Need more data for body
             [self readRtspResponse:completion];
             return;
         }
-        
-        // Extract full response
-        NSData *responseData = [self.readBuffer subdataWithRange:NSMakeRange(0, totalNeeded)];
-        NSString *response = [[NSString alloc] initWithData:responseData encoding:NSUTF8StringEncoding];
+
+        // Extract full response (header + optional body). This range excludes any
+        // trailing interleaved RTP bytes, so the text decode succeeds.
+        NSData *responseData = [self.readBuffer subdataWithRange:NSMakeRange(0, (NSUInteger)totalNeeded)];
+        NSString *response = [[NSString alloc] initWithData:responseData encoding:NSUTF8StringEncoding]
+                          ?: [[NSString alloc] initWithData:responseData encoding:NSASCIIStringEncoding];
         
         // Remove consumed data from buffer (keep any leftover for interleaved frames)
         NSData *remaining = nil;
