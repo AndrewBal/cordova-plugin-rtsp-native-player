@@ -290,8 +290,6 @@ public class RtspNativePlayerActivity extends Activity implements
     //  Native pipeline lifecycle
     // ────────────────────────────────────────────────
 
-
-
     /** True when front/rear are distinct stream URLs (e.g. TF808 ch00/ch01): switch by URL, no HTTP. */
     private boolean isUrlSwitch() {
         return rearUrl != null && rearUrl.length() > 0 && !rearUrl.equals(frontUrl);
@@ -308,8 +306,17 @@ public class RtspNativePlayerActivity extends Activity implements
         });
     }
 
-
     private void startPipeline(String url) {
+        if (url == null || !url.regionMatches(true, 0, "rtsp://", 0, 7)) {
+            // Native pipeline speaks RTSP only — a file://…m3u8 (e.g. an app-side
+            // FFmpeg→HLS detour) can't be played here. Fail loudly instead of
+            // parsing it as a host.
+            Log.e(TAG, "Not an rtsp:// URL: " + url);
+            setStatus("ERROR", null, "Invalid stream URL");
+            RtspHlsPlayer.sendErrorToJs("Native player requires an rtsp:// URL, got: " + url);
+            showLoading(false);
+            return;
+        }
         synchronized (pipelineLock) {
             if (rtspClient != null) return;
             decoderConfigured = false;
